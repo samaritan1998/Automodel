@@ -28,6 +28,7 @@ except ImportError:
 import inspect
 import importlib
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -912,10 +913,22 @@ def build_wandb(cfg) -> wandb.Run:
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
+    settings_kwargs = {"silent": True}
+    init_timeout = kwargs.pop("init_timeout", None)
+    if init_timeout not in (None, ""):
+        # Older wandb versions do not accept init_timeout as wandb.init().
+        # Prefer Settings when available, and also set the env fallback.
+        os.environ.setdefault("WANDB_INIT_TIMEOUT", str(init_timeout))
+        settings_kwargs["init_timeout"] = float(init_timeout)
+    try:
+        settings = Settings(**settings_kwargs)
+    except TypeError:
+        settings_kwargs.pop("init_timeout", None)
+        settings = Settings(**settings_kwargs)
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
-        settings=Settings(silent=True),
+        settings=settings,
     )
     return run
 
