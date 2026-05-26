@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import os
 from typing import List, Optional, Set
 
 import torch
@@ -198,6 +199,7 @@ def make_cp_batch_and_ctx(
     batch,
     loss_mask=None,
     use_te: bool = False,
+    use_dsv4_cp: bool = False,
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
@@ -243,6 +245,13 @@ def make_cp_batch_and_ctx(
 
     if _get_mesh_size(cp_mesh) <= 1:
         return nullcontext, batch
+
+    if use_dsv4_cp:
+        return nullcontext, make_cp_batch_for_dsv4(
+            cp_mesh,
+            batch,
+            padding_token_id=padding_token_id,
+        )
 
     # Remove attention_mask from the batch so the model does not attempt to
     # build a 4D causal mask (which would have mismatched shapes with
@@ -359,6 +368,159 @@ def make_cp_batch_and_ctx(
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
     return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
+
+
+def _pad_tensor_along_dim(tensor: torch.Tensor, pad_len: int, dim: int, value) -> torch.Tensor:
+    if pad_len <= 0:
+        return tensor
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = pad_len
+    pad = torch.full(pad_shape, value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, pad], dim=dim)
+
+
+def _validate_dsv4_manual_cp_batch(batch, seq_len: int, *, packed_thd: bool = False) -> None:
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    position_ids = batch["position_ids"]
+    if input_ids.ndim != 2 or labels.ndim != 2 or position_ids.ndim != 2:
+        raise ValueError("DeepSeek V4 manual CP supports only 2D BSH-style input_ids, labels, and position_ids")
+    if labels.shape != input_ids.shape or position_ids.shape != input_ids.shape:
+        raise ValueError("DeepSeek V4 manual CP requires input_ids, labels, and position_ids to have the same shape")
+    if packed_thd:
+        if "seq_ids" not in batch:
+            raise ValueError("DeepSeek V4 packed manual CP requires seq_ids from packed_sequence_thd_collater")
+        seq_ids = batch["seq_ids"]
+        if not isinstance(seq_ids, torch.Tensor) or seq_ids.ndim != 2:
+            raise ValueError("DeepSeek V4 packed manual CP supports only 2D seq_ids")
+        if seq_ids.shape != input_ids.shape:
+            raise ValueError("DeepSeek V4 packed manual CP requires seq_ids to match input_ids shape")
+
+    valid_mask = None
+    if "attention_mask" in batch:
+        attention_mask = batch["attention_mask"]
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            raise ValueError("DeepSeek V4 manual CP supports only 2D right-padded attention_mask")
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("DeepSeek V4 manual CP requires attention_mask to match input_ids shape")
+        valid_mask = attention_mask.to(torch.bool)
+    elif "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
+        if not isinstance(padding_mask, torch.Tensor) or padding_mask.ndim != 2:
+            raise ValueError("DeepSeek V4 manual CP supports only 2D right-padded padding_mask")
+        if padding_mask.shape != input_ids.shape:
+            raise ValueError("DeepSeek V4 manual CP requires padding_mask to match input_ids shape")
+        valid_mask = padding_mask.logical_not()
+
+    if packed_thd:
+        return
+
+    expected = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
+    if valid_mask is not None:
+        valid_int = valid_mask.to(torch.int8)
+        if (valid_int[:, 1:] > valid_int[:, :-1]).any():
+            raise ValueError("DeepSeek V4 manual CP supports only right padding; left/internal padding is unsupported")
+        if not torch.equal(position_ids[valid_mask], expected[valid_mask]):
+            raise ValueError("DeepSeek V4 manual CP requires contiguous position_ids over valid tokens")
+    elif not torch.equal(position_ids, expected):
+        raise ValueError("DeepSeek V4 manual CP requires contiguous position_ids when no padding mask is present")
+
+
+def _dsv4_cp_layout() -> str:
+    return os.environ.get("DSV4_CP_LAYOUT", "contiguous").strip().lower().replace("-", "_")
+
+
+def _dsv4_zigzag_indices(seq_len: int, cp_size: int, cp_rank: int, device: torch.device) -> torch.Tensor:
+    if seq_len % (2 * cp_size) != 0:
+        raise ValueError(
+            "DeepSeek V4 zigzag CP requires sequence length to be divisible by 2*cp_size "
+            f"(seq_len={seq_len}, cp_size={cp_size})"
+        )
+    half_len = seq_len // (2 * cp_size)
+    first_start = cp_rank * half_len
+    second_start = (2 * cp_size - cp_rank - 1) * half_len
+    first = torch.arange(first_start, first_start + half_len, device=device)
+    second = torch.arange(second_start, second_start + half_len, device=device)
+    return torch.cat((first, second), dim=0)
+
+
+def make_cp_batch_for_dsv4(cp_mesh, batch, padding_token_id: int = 0):
+    """Manually sequence-shard a DeepSeek V4 batch for sparse-attention CP."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return batch
+    if "input_ids" not in batch or "labels" not in batch:
+        raise ValueError("DeepSeek V4 manual CP requires input_ids and labels")
+
+    packed_thd = batch.get("qkv_format") == "thd"
+    cp_size = cp_mesh.size()
+    cp_rank = torch.distributed.get_rank(group=cp_mesh.get_group())
+    input_ids = batch["input_ids"]
+    seq_len = input_ids.shape[1]
+    batch["dsv4_token_positions"] = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(
+        input_ids.shape[0],
+        -1,
+    )
+    if "attention_mask" in batch and "padding_mask" not in batch:
+        batch["padding_mask"] = batch["attention_mask"].to(torch.bool).logical_not()
+
+    cp_layout = _dsv4_cp_layout()
+    if cp_layout not in {"contiguous", "zigzag"}:
+        raise ValueError(f"Unsupported DeepSeek V4 CP layout: {cp_layout!r}")
+    divisibility = 2 * cp_size if cp_layout == "zigzag" else cp_size
+    pad_len = (-seq_len) % divisibility
+
+    if "position_ids" not in batch:
+        batch["position_ids"] = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(
+            input_ids.shape[0],
+            -1,
+        )
+
+    _validate_dsv4_manual_cp_batch(batch, seq_len, packed_thd=packed_thd)
+
+    if pad_len:
+        batch["input_ids"] = _pad_tensor_along_dim(batch["input_ids"], pad_len, 1, padding_token_id)
+        batch["labels"] = _pad_tensor_along_dim(batch["labels"], pad_len, 1, -100)
+        batch["position_ids"] = _pad_tensor_along_dim(batch["position_ids"], pad_len, 1, 0)
+        batch["dsv4_token_positions"] = _pad_tensor_along_dim(batch["dsv4_token_positions"], pad_len, 1, 0)
+        if "attention_mask" in batch:
+            batch["attention_mask"] = _pad_tensor_along_dim(batch["attention_mask"], pad_len, 1, 0)
+        if "padding_mask" in batch:
+            batch["padding_mask"] = _pad_tensor_along_dim(batch["padding_mask"], pad_len, 1, True)
+        if "seq_ids" in batch:
+            batch["seq_ids"] = _pad_tensor_along_dim(batch["seq_ids"], pad_len, 1, -1)
+
+    padded_seq_len = batch["input_ids"].shape[1]
+    cp_sharded_keys = (
+        "input_ids",
+        "labels",
+        "position_ids",
+        "attention_mask",
+        "padding_mask",
+        "seq_ids",
+        "dsv4_token_positions",
+    )
+    if cp_layout == "zigzag":
+        indices = _dsv4_zigzag_indices(padded_seq_len, cp_size, cp_rank, input_ids.device)
+        for key in cp_sharded_keys:
+            if key in batch and isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].index_select(1, indices).contiguous()
+    else:
+        shard_len = padded_seq_len // cp_size
+        start = cp_rank * shard_len
+        end = start + shard_len
+        for key in cp_sharded_keys:
+            if key in batch and isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key][:, start:end].contiguous()
+
+    # DSV4 sparse attention builds its own causal/top-k indices from seq ids
+    # and position ids. Keep padding_mask for MoE; remove dense attention_mask.
+    batch.pop("attention_mask", None)
+    if "seq_ids" in batch:
+        batch["dsv4_seq_ids"] = batch["seq_ids"]
+    batch["dsv4_cp_size"] = cp_size
+    batch["dsv4_cp_rank"] = cp_rank
+    batch["dsv4_cp_layout"] = cp_layout
+    return batch
 
 
 def make_cp_batch_for_te(
@@ -507,6 +669,14 @@ def _shard_thd_chunk_for_te(
             batch[key] = val
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
+    if "padding_mask" in batch and batch["padding_mask"] is not None:
+        padding_mask = batch["padding_mask"].to(torch.bool).contiguous()
+    elif "attention_mask" in batch and batch["attention_mask"] is not None:
+        padding_mask = batch["attention_mask"].to(torch.bool).logical_not().contiguous()
+    elif batch["input_ids"].ndim == 1:
+        padding_mask = (batch["input_ids"] == padding_token_id).bool().contiguous()
+    else:
+        padding_mask = torch.zeros(batch["input_ids"].shape[0], dtype=torch.bool, device=batch["input_ids"].device)
     output_batch = {
         "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
         "labels": batch["labels"].to(torch.int64).contiguous(),
@@ -514,7 +684,7 @@ def _shard_thd_chunk_for_te(
         "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
         "max_seqlen": torch.tensor(max_seqlen).to(torch.int32).to(device=cu_seqlens_padded.device),
         "qkv_format": qkv_format,
-        "padding_mask": (batch["input_ids"] == padding_token_id).bool().contiguous(),
+        "padding_mask": padding_mask,
         "cp_size": cp_size,
         "cp_rank": cp_rank,
     }

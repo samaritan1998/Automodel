@@ -65,6 +65,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _dsv4_kernel_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
+    build_packed_causal_padding_mask_from_seq_ids,
 )
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
@@ -158,6 +159,7 @@ class DeepseekV4Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         # x throughout this layer: [B, S, hc_mult, hidden] (HC multi-copy state)
@@ -177,6 +179,8 @@ class DeepseekV4Block(nn.Module):
                 attention_mask=attention_mask,
                 position_embeddings_compress=position_embeddings_compress,
                 rotary_compress=rotary_compress,
+                position_ids=position_ids,
+                **attn_kwargs,
             )
             dtype = hidden_streams.dtype
             # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
@@ -451,30 +455,51 @@ class DeepseekV4Model(nn.Module):
         # layer in the released DSV4-Flash was trained under it.
         sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
         packed_seq_lens = None
-        if attn_kwargs.get("qkv_format") == "thd":
+        attention_mask_4d = None
+        attention_mask_ready = False
+        if (
+            attn_kwargs.get("dsv4_cp_size", 1) > 1
+            and getattr(getattr(self, "backend", None), "attn", None) == "tilelang"
+        ):
+            attention_mask_4d = None
+            attention_mask_ready = True
+        elif attn_kwargs.get("qkv_format") == "thd" and isinstance(
+            attn_kwargs.get("dsv4_seq_ids", attn_kwargs.get("seq_ids")),
+            torch.Tensor,
+        ):
+            attention_mask_4d = build_packed_causal_padding_mask_from_seq_ids(
+                attn_kwargs.get("dsv4_seq_ids", attn_kwargs.get("seq_ids")),
+                seq_len=shape_ref.shape[1],
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                sliding_window=sliding_window,
+            )
+            attention_mask_ready = True
+        elif attn_kwargs.get("qkv_format") == "thd":
             # THD packing uses seq_lens_padded to keep pack/CP padding inside a
             # valid block. Using only seq_lens leaves trailing pad query rows
             # with no legal keys, which the sparse TileLang path cannot execute.
             packed_seq_lens = attn_kwargs.get("seq_lens_padded")
             if packed_seq_lens is None:
                 packed_seq_lens = attn_kwargs.get("seq_lens")
-        if packed_seq_lens is not None:
-            attention_mask_4d = build_packed_causal_padding_mask(
-                packed_seq_lens,
-                seq_len=shape_ref.shape[1],
-                dtype=shape_ref.dtype,
-                device=shape_ref.device,
-                sliding_window=sliding_window,
-            )
-        else:
-            attention_mask_4d = build_causal_padding_mask(
-                attention_mask,
-                seq_len=shape_ref.shape[1],
-                dtype=shape_ref.dtype,
-                device=shape_ref.device,
-                batch_size=shape_ref.shape[0],
-                sliding_window=sliding_window,
-            )
+        if not attention_mask_ready:
+            if packed_seq_lens is not None:
+                attention_mask_4d = build_packed_causal_padding_mask(
+                    packed_seq_lens,
+                    seq_len=shape_ref.shape[1],
+                    dtype=shape_ref.dtype,
+                    device=shape_ref.device,
+                    sliding_window=sliding_window,
+                )
+            else:
+                attention_mask_4d = build_causal_padding_mask(
+                    attention_mask,
+                    seq_len=shape_ref.shape[1],
+                    dtype=shape_ref.dtype,
+                    device=shape_ref.device,
+                    batch_size=shape_ref.shape[0],
+                    sliding_window=sliding_window,
+                )
 
         # ``input_ids`` is only meaningful for hash-routing layers, which live
         # on stage 0 (num_hash_layers <= layers per stage 0).  Mid-stages pass
@@ -498,6 +523,7 @@ class DeepseekV4Model(nn.Module):
                     else None
                 ),
                 input_ids=layer_input_ids,
+                position_ids=position_ids,
                 **attn_kwargs,
             )
 

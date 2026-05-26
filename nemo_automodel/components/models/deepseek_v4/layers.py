@@ -71,6 +71,9 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     dsv4_indexer_scores,
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
+    packed_query_positions,
+    resolve_pooled_seq_positions,
+    streaming_indexer_topk_indices_torch,
 )
 
 
@@ -82,6 +85,354 @@ def _dsv4_kernel_backend(backend: BackendConfig) -> str:
 def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
     """RMS-normalize the last dim without materializing an ``x.square()`` tensor."""
     return F.rms_norm(x, (x.shape[-1],), eps=eps)
+
+
+def _cp_mesh_enabled(cp_mesh) -> bool:
+    return (
+        cp_mesh is not None
+        and cp_mesh.size() > 1
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    )
+
+
+def _cp_mesh_rank(cp_mesh) -> int:
+    if not _cp_mesh_enabled(cp_mesh):
+        return 0
+    return torch.distributed.get_rank(group=cp_mesh.get_group())
+
+
+def _cp_all_gather(tensor: torch.Tensor, cp_mesh, dim: int) -> torch.Tensor:
+    if not _cp_mesh_enabled(cp_mesh):
+        return tensor
+    from torch.distributed.nn.functional import all_gather
+
+    return torch.cat(tuple(all_gather(tensor.contiguous(), group=cp_mesh.get_group())), dim=dim).contiguous()
+
+
+def _dsv4_cp_layout(value: Any = None) -> str:
+    return str(value if value is not None else "contiguous").strip().lower().replace("-", "_")
+
+
+def _cp_layout_is_zigzag(layout: str) -> bool:
+    return layout in {"zigzag", "dual_chunk", "dual_chunk_swap", "dualchunkswap"}
+
+
+def _split_zigzag_halves(tensor: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    local_len = tensor.shape[dim]
+    if local_len % 2 != 0:
+        raise ValueError(f"DeepSeek V4 zigzag CP requires even local sequence length, got {local_len}")
+    half_len = local_len // 2
+    return tensor.narrow(dim, 0, half_len), tensor.narrow(dim, half_len, half_len)
+
+
+def _cat_zigzag_global_order(first_parts: tuple[torch.Tensor, ...], second_parts: tuple[torch.Tensor, ...], dim: int):
+    return torch.cat((*first_parts, *reversed(second_parts)), dim=dim).contiguous()
+
+
+def _cp_all_gather_zigzag_halves(tensor: torch.Tensor, cp_mesh, dim: int) -> torch.Tensor:
+    if not _cp_mesh_enabled(cp_mesh):
+        return tensor
+    from torch.distributed.nn.functional import all_gather
+
+    first, second = _split_zigzag_halves(tensor, dim)
+    first_parts = tuple(all_gather(first.contiguous(), group=cp_mesh.get_group()))
+    second_parts = tuple(all_gather(second.contiguous(), group=cp_mesh.get_group()))
+    return _cat_zigzag_global_order(first_parts, second_parts, dim)
+
+
+def _query_positions_1d(position_ids: torch.Tensor | None, seq_len: int, device: torch.device, fallback_start: int):
+    if position_ids is None:
+        return torch.arange(fallback_start, fallback_start + seq_len, device=device, dtype=torch.int64)
+    if position_ids.ndim != 2 or position_ids.shape[1] != seq_len:
+        raise ValueError(f"DeepSeek V4 CP expects 2D position_ids with seq_len={seq_len}, got {tuple(position_ids.shape)}")
+    return position_ids[0].to(device=device, dtype=torch.int64).contiguous()
+
+
+def _cp_gather_sliding_window_kv(
+    kv: torch.Tensor,
+    cp_mesh,
+    window_size: int,
+    *,
+    cp_layout: str = "contiguous",
+) -> tuple[torch.Tensor, int]:
+    """Gather only the raw KV span needed by sliding-window attention."""
+    if not _cp_mesh_enabled(cp_mesh):
+        return kv, 0
+    if _cp_layout_is_zigzag(cp_layout):
+        return _cp_all_gather_zigzag_halves(kv, cp_mesh, dim=2), 0
+
+    cp_rank = _cp_mesh_rank(cp_mesh)
+    local_seq_len = kv.shape[2]
+    tail_len = max(0, min(window_size - 1, local_seq_len))
+    if tail_len == 0:
+        return kv, cp_rank * local_seq_len
+    if tail_len < window_size - 1:
+        return _cp_all_gather(kv, cp_mesh, dim=2), 0
+
+    from torch.distributed.nn.functional import all_gather
+
+    tails = tuple(all_gather(kv[:, :, -tail_len:, :].contiguous(), group=cp_mesh.get_group()))
+    prefix = kv[:, :, :0, :] if cp_rank == 0 else tails[cp_rank - 1]
+    raw_start = 0 if cp_rank == 0 else cp_rank * local_seq_len - tail_len
+    return torch.cat([prefix, kv], dim=2).contiguous(), raw_start
+
+
+def _cp_gather_sliding_window_metadata(
+    tensor: torch.Tensor,
+    cp_mesh,
+    window_size: int,
+    *,
+    cp_layout: str = "contiguous",
+) -> tuple[torch.Tensor, int]:
+    """Gather token metadata with the same raw-KV span used for sparse attention."""
+    if not _cp_mesh_enabled(cp_mesh):
+        return tensor, 0
+    if _cp_layout_is_zigzag(cp_layout):
+        return _cp_all_gather_zigzag_halves(tensor, cp_mesh, dim=1), 0
+
+    cp_rank = _cp_mesh_rank(cp_mesh)
+    local_seq_len = tensor.shape[1]
+    tail_len = max(0, min(window_size - 1, local_seq_len))
+    if tail_len == 0:
+        return tensor, cp_rank * local_seq_len
+    if tail_len < window_size - 1:
+        return _cp_all_gather(tensor, cp_mesh, dim=1), 0
+
+    from torch.distributed.nn.functional import all_gather
+
+    tails = tuple(all_gather(tensor[:, -tail_len:].contiguous(), group=cp_mesh.get_group()))
+    prefix = tensor[:, :0] if cp_rank == 0 else tails[cp_rank - 1]
+    raw_start = 0 if cp_rank == 0 else cp_rank * local_seq_len - tail_len
+    return torch.cat([prefix, tensor], dim=1).contiguous(), raw_start
+
+
+def _gather_full_cp_metadata(tensor: torch.Tensor | None, cp_mesh, *, cp_layout: str) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if not _cp_mesh_enabled(cp_mesh):
+        return tensor
+    if _cp_layout_is_zigzag(cp_layout):
+        return _cp_all_gather_zigzag_halves(tensor, cp_mesh, dim=1)
+    return _cp_all_gather(tensor, cp_mesh, dim=1)
+
+
+def _pad_metadata_to_len(tensor: torch.Tensor | None, target_len: int, *, value: int) -> torch.Tensor | None:
+    if tensor is None or tensor.shape[1] >= target_len:
+        return tensor
+    return F.pad(tensor, (0, target_len - tensor.shape[1]), value=value)
+
+
+def _pool_seq_ids(
+    seq_ids: torch.Tensor | None,
+    ratio: int,
+    pooled_len: int | None = None,
+    *,
+    overlap: bool = False,
+) -> torch.Tensor | None:
+    del overlap
+    if seq_ids is None or ratio <= 0:
+        return None
+    usable = (seq_ids.shape[1] // ratio) * ratio
+    if usable == 0:
+        pooled = seq_ids.new_empty((seq_ids.shape[0], 0))
+    else:
+        windows = seq_ids[:, :usable].view(seq_ids.shape[0], usable // ratio, ratio)
+        first = windows[:, :, 0]
+        valid = (first >= 0) & (windows == first.unsqueeze(-1)).all(dim=-1)
+        pooled = torch.where(valid, first, torch.full_like(first, -1)).contiguous()
+    if pooled_len is not None:
+        pooled = pooled[:, :pooled_len].contiguous()
+    return pooled
+
+
+def _pool_position_ordinals(
+    position_ids: torch.Tensor | None,
+    ratio: int,
+    pooled_len: int | None = None,
+    *,
+    pooled_seq_ids: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if position_ids is None or ratio <= 0:
+        return None
+    usable = (position_ids.shape[1] // ratio) * ratio
+    if usable == 0:
+        positions = position_ids.new_empty((position_ids.shape[0], 0))
+    else:
+        positions = (position_ids[:, :usable:ratio] // ratio).contiguous()
+    if pooled_len is not None:
+        positions = positions[:, :pooled_len].contiguous()
+    if pooled_seq_ids is not None:
+        pooled_seq_ids = pooled_seq_ids.to(device=positions.device, dtype=torch.int64)
+        if pooled_seq_ids.shape != positions.shape:
+            raise ValueError(
+                f"pooled_seq_ids and pooled position ordinals must have matching shape, "
+                f"got {tuple(pooled_seq_ids.shape)} vs {tuple(positions.shape)}"
+            )
+        positions = torch.where(pooled_seq_ids >= 0, positions, torch.full_like(positions, -1))
+    return positions
+
+
+def _pad_raw_kv_before_compressed_for_tilelang(raw_kv: torch.Tensor, *, multiple: int = 64) -> torch.Tensor:
+    if multiple <= 1:
+        return raw_kv
+    remainder = raw_kv.shape[2] % multiple
+    if remainder == 0:
+        return raw_kv
+    pad = raw_kv.new_zeros((*raw_kv.shape[:2], multiple - remainder, raw_kv.shape[-1]))
+    return torch.cat((raw_kv, pad), dim=2).contiguous()
+
+
+def _cp_previous_rank_tail(tensor: torch.Tensor, cp_mesh, tail_len: int) -> torch.Tensor:
+    if not _cp_mesh_enabled(cp_mesh) or tail_len <= 0:
+        return tensor[:, :0, :]
+    from torch.distributed.nn.functional import all_gather
+
+    tails = tuple(all_gather(tensor[:, -tail_len:, :].contiguous(), group=cp_mesh.get_group()))
+    cp_rank = _cp_mesh_rank(cp_mesh)
+    return tensor[:, :0, :] if cp_rank == 0 else tails[cp_rank - 1]
+
+
+def _pool_projected_windows(
+    kv: torch.Tensor,
+    gate: torch.Tensor,
+    ape: torch.Tensor,
+    kv_norm: nn.Module,
+    rotary: nn.Module,
+    *,
+    ratio: int,
+    head_dim: int,
+    rope_head_dim: int,
+    overlap: bool,
+    start_pos: int,
+    pool_position_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if kv.shape != gate.shape:
+        raise ValueError(f"DeepSeek V4 projected kv/gate shape mismatch: {kv.shape} vs {gate.shape}")
+    usable = (kv.shape[1] // ratio) * ratio
+    ready_kv = kv[:, :usable]
+    ready_gate = gate[:, :usable]
+    overlap_reset_mask = None
+    if overlap and pool_position_ids is not None and usable > 0:
+        pool_position_ids = pool_position_ids.to(device=kv.device, dtype=torch.int64)
+        overlap_reset_mask = pool_position_ids[:, :usable:ratio].eq(0).contiguous()
+    pooled = _pool_windows(
+        ready_kv,
+        ready_gate,
+        ape,
+        ratio,
+        head_dim,
+        overlap=overlap,
+        overlap_reset_mask=overlap_reset_mask,
+    )
+    norm_weight = getattr(kv_norm, "weight", None)
+    if norm_weight is not None:
+        pooled = pooled.to(norm_weight.dtype)
+    pooled = kv_norm(pooled)
+    if pooled.shape[1] > 0:
+        if pool_position_ids is None:
+            positions = _rope_pool_positions(pooled.shape[1], start_pos, ratio, pooled.device, pooled.shape[0])
+        else:
+            pool_position_ids = pool_position_ids.to(device=pooled.device, dtype=torch.int64)
+            positions = pool_position_ids[:, :usable:ratio][:, : pooled.shape[1]].contiguous()
+        cos, sin = rotary(pooled, positions)
+        pooled = _apply_partial_rope(pooled.unsqueeze(1), cos, sin, rope_head_dim).squeeze(1)
+    return pooled
+
+
+def _cp_pool_projected_and_gather(
+    hidden_states: torch.Tensor,
+    pooler,
+    rotary: nn.Module,
+    cp_mesh,
+    local_start: int,
+    *,
+    cp_layout: str = "contiguous",
+):
+    if not _cp_mesh_enabled(cp_mesh):
+        return None
+    ratio = int(pooler.compress_ratio)
+    if ratio <= 0 or hidden_states.shape[1] % ratio != 0:
+        return None
+
+    hidden_states_fp32 = hidden_states.float()
+    kv = pooler.wkv(hidden_states_fp32)
+    gate = pooler.wgate(hidden_states_fp32)
+
+    if _cp_layout_is_zigzag(cp_layout):
+        if hidden_states.shape[1] % 2 != 0:
+            raise ValueError("DeepSeek V4 zigzag CP pooling requires even local sequence length")
+        half_len = hidden_states.shape[1] // 2
+        if half_len % ratio != 0:
+            return None
+        cp_rank = _cp_mesh_rank(cp_mesh)
+        cp_size = cp_mesh.size()
+        low_start = cp_rank * half_len
+        high_start = (2 * cp_size - cp_rank - 1) * half_len
+        kv_low, kv_high = _split_zigzag_halves(kv, dim=1)
+        gate_low, gate_high = _split_zigzag_halves(gate, dim=1)
+        prefix_len = min(ratio, half_len) if getattr(pooler, "overlap", False) else 0
+        if prefix_len > 0:
+            from torch.distributed.nn.functional import all_gather
+
+            kv_low_tails = tuple(all_gather(kv_low[:, -prefix_len:, :].contiguous(), group=cp_mesh.get_group()))
+            kv_high_tails = tuple(all_gather(kv_high[:, -prefix_len:, :].contiguous(), group=cp_mesh.get_group()))
+            gate_low_tails = tuple(all_gather(gate_low[:, -prefix_len:, :].contiguous(), group=cp_mesh.get_group()))
+            gate_high_tails = tuple(all_gather(gate_high[:, -prefix_len:, :].contiguous(), group=cp_mesh.get_group()))
+            kv_low_prefix = kv_low[:, :0, :] if cp_rank == 0 else kv_low_tails[cp_rank - 1]
+            gate_low_prefix = gate_low[:, :0, :] if cp_rank == 0 else gate_low_tails[cp_rank - 1]
+            if cp_rank == cp_size - 1:
+                kv_high_prefix = kv_low_tails[cp_rank]
+                gate_high_prefix = gate_low_tails[cp_rank]
+            else:
+                kv_high_prefix = kv_high_tails[cp_rank + 1]
+                gate_high_prefix = gate_high_tails[cp_rank + 1]
+        else:
+            kv_low_prefix = kv_low[:, :0, :]
+            kv_high_prefix = kv_high[:, :0, :]
+            gate_low_prefix = gate_low[:, :0, :]
+            gate_high_prefix = gate_high[:, :0, :]
+
+        def _pool_segment(segment_kv, segment_gate, prefix_kv, prefix_gate, segment_start):
+            drop_pools = 0
+            pool_start = segment_start
+            if prefix_kv.shape[1] > 0:
+                segment_kv = torch.cat([prefix_kv, segment_kv], dim=1)
+                segment_gate = torch.cat([prefix_gate, segment_gate], dim=1)
+                pool_start = segment_start - prefix_kv.shape[1]
+                drop_pools = prefix_kv.shape[1] // ratio
+            pooled = pooler.pool_projected(segment_kv, segment_gate, rotary, start_pos=pool_start)
+            return pooled[:, drop_pools:] if drop_pools else pooled
+
+        low_pooled = _pool_segment(kv_low, gate_low, kv_low_prefix, gate_low_prefix, low_start)
+        high_pooled = _pool_segment(kv_high, gate_high, kv_high_prefix, gate_high_prefix, high_start)
+        from torch.distributed.nn.functional import all_gather
+
+        low_parts = tuple(all_gather(low_pooled.contiguous(), group=cp_mesh.get_group()))
+        high_parts = tuple(all_gather(high_pooled.contiguous(), group=cp_mesh.get_group()))
+        return _cat_zigzag_global_order(low_parts, high_parts, dim=1)
+
+    pool_start = local_start
+    drop_pools = 0
+    if pooler.overlap:
+        prefix_kv = _cp_previous_rank_tail(kv, cp_mesh, ratio)
+        prefix_gate = _cp_previous_rank_tail(gate, cp_mesh, ratio)
+        if prefix_kv.shape[1] > 0:
+            kv = torch.cat([prefix_kv, kv], dim=1)
+            gate = torch.cat([prefix_gate, gate], dim=1)
+            pool_start = local_start - ratio
+            drop_pools = 1
+
+    local_pooled = pooler.pool_projected(kv, gate, rotary, start_pos=pool_start)
+    if drop_pools:
+        local_pooled = local_pooled[:, drop_pools:]
+    return _cp_all_gather(local_pooled, cp_mesh, dim=1)
+
+
+def _first_position(position_ids: torch.Tensor | None, fallback: int) -> int:
+    if position_ids is None:
+        return fallback
+    return int(position_ids.reshape(-1)[0].item())
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +704,12 @@ def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, r
     return _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim)
 
 
-def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -> torch.Tensor:
+def _overlap_transform(
+    tensor: torch.Tensor,
+    head_dim: int,
+    fill_value: float,
+    reset_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Reshape ``[B, S, ratio, 2*head_dim]`` -> ``[B, S, 2*ratio, head_dim]`` with the
     cross-window overlap from the DeepSeek inference reference (``Compressor.overlap_transform``
     in ``dsv4flash/inference/model.py:307-314``).
@@ -370,7 +726,17 @@ def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -
     b, s, ratio, _ = tensor.shape
     new = tensor.new_full((b, s, 2 * ratio, head_dim), fill_value)
     new[:, :, ratio:] = tensor[:, :, :, head_dim:]
-    new[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
+    if s > 1:
+        prev = tensor[:, :-1, :, :head_dim]
+        if reset_mask is None:
+            new[:, 1:, :ratio] = prev
+        else:
+            reset_mask = reset_mask.to(device=tensor.device, dtype=torch.bool)
+            if reset_mask.shape != (b, s):
+                raise ValueError(f"overlap reset_mask must have shape {(b, s)}, got {tuple(reset_mask.shape)}")
+            keep_prev = ~reset_mask[:, 1:]
+            fill = tensor.new_full(prev.shape, fill_value)
+            new[:, 1:, :ratio] = torch.where(keep_prev[:, :, None, None], prev, fill)
     return new
 
 
@@ -381,6 +747,7 @@ def _pool_windows(
     ratio: int,
     head_dim: int,
     overlap: bool = False,
+    overlap_reset_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Softmax-gated sum-pool over ``ratio`` consecutive tokens.
 
@@ -411,8 +778,8 @@ def _pool_windows(
     kv_w = kv.view(batch, n_windows, ratio, feat)
     gate_w = gate.view(batch, n_windows, ratio, feat) + ape
     if overlap:
-        kv_w = _overlap_transform(kv_w, head_dim, fill_value=0.0)
-        gate_w = _overlap_transform(gate_w, head_dim, fill_value=float("-inf"))
+        kv_w = _overlap_transform(kv_w, head_dim, fill_value=0.0, reset_mask=overlap_reset_mask)
+        gate_w = _overlap_transform(gate_w, head_dim, fill_value=float("-inf"), reset_mask=overlap_reset_mask)
     return (kv_w * gate_w.softmax(dim=2)).sum(dim=2)
 
 
@@ -496,6 +863,40 @@ def build_packed_causal_padding_mask(
     same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
     not_padding = doc_ids > 0
     idx = torch.arange(seq_len, device=device)
+    causal = idx.unsqueeze(0) <= idx.unsqueeze(1)
+    allowed = same_doc & causal.unsqueeze(0) & not_padding.unsqueeze(2) & not_padding.unsqueeze(1)
+    if sliding_window is not None and sliding_window > 0:
+        allowed = allowed & ((idx.unsqueeze(1) - idx.unsqueeze(0)) < sliding_window).unsqueeze(0)
+
+    min_value = torch.finfo(dtype).min if dtype.is_floating_point else -1e9
+    return torch.where(
+        allowed.unsqueeze(1),
+        torch.zeros((), dtype=dtype, device=device),
+        torch.full((), min_value, dtype=dtype, device=device),
+    )
+
+
+def build_packed_causal_padding_mask_from_seq_ids(
+    seq_ids: torch.Tensor,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Build a packed causal mask from explicit sample ids.
+
+    This is safer than reconstructing boundaries from ``seq_lens`` when the
+    packer inserts per-sample padding for CP/compressor alignment.
+    """
+    if seq_ids.dim() == 1:
+        seq_ids = seq_ids.unsqueeze(0)
+    seq_ids = seq_ids.to(device=device, dtype=torch.long)
+    if seq_ids.shape[1] != seq_len:
+        raise ValueError(f"seq_ids must have sequence length {seq_len}, got {seq_ids.shape[1]}")
+
+    idx = torch.arange(seq_len, device=device)
+    same_doc = seq_ids.unsqueeze(2) == seq_ids.unsqueeze(1)
+    not_padding = seq_ids >= 0
     causal = idx.unsqueeze(0) <= idx.unsqueeze(1)
     allowed = same_doc & causal.unsqueeze(0) & not_padding.unsqueeze(2) & not_padding.unsqueeze(1)
     if sliding_window is not None and sliding_window > 0:
@@ -596,6 +997,8 @@ class DeepseekV4Indexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
+        self.topk_query_block_size = int(getattr(config, "indexer_topk_query_block_size", 256) or 256)
+        self.topk_key_block_size = int(getattr(config, "indexer_topk_key_block_size", 2048) or 2048)
         self.softmax_scale = self.head_dim**-0.5
         proj_dim = 2 * self.head_dim  # overlap mode
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
@@ -609,6 +1012,29 @@ class DeepseekV4Indexer(nn.Module):
     def ape(self) -> torch.Tensor:
         return self.ape_param()
 
+    def pool_projected(
+        self,
+        kv: torch.Tensor,
+        gate: torch.Tensor,
+        rotary: nn.Module,
+        *,
+        start_pos: int,
+        pool_position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _pool_projected_windows(
+            kv,
+            gate,
+            self.ape_param(kv),
+            self.kv_norm,
+            rotary,
+            ratio=self.compress_ratio,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            overlap=self.overlap,
+            start_pos=start_pos,
+            pool_position_ids=pool_position_ids,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -618,47 +1044,90 @@ class DeepseekV4Indexer(nn.Module):
         cache: DeepseekV4TrainCache,
         layer_idx: int,
         start_pos: int,
+        query_hidden_states: torch.Tensor | None = None,
+        query_q_residual: torch.Tensor | None = None,
+        query_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        query_start: int = 0,
+        query_positions: torch.Tensor | None = None,
+        streaming_topk: bool = False,
+        projected_kv: torch.Tensor | None = None,
+        projected_gate: torch.Tensor | None = None,
+        precomputed_pooled_kv: torch.Tensor | None = None,
+        pool_position_ids: torch.Tensor | None = None,
+        query_seq_ids: torch.Tensor | None = None,
+        pooled_seq_ids: torch.Tensor | None = None,
+        pooled_seq_positions: torch.Tensor | None = None,
+        query_sample_positions: torch.Tensor | None = None,
     ) -> torch.LongTensor:
-        input_dtype = hidden_states.dtype
-        batch, seq_len, _ = hidden_states.shape
-        hidden_states_fp32 = hidden_states.float()
-        kv = self.wkv(hidden_states_fp32)
-        gate = self.wgate(hidden_states_fp32)
-        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-            kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
-        )
-        new_pooled = self.kv_norm(
-            _pool_windows(
+        if precomputed_pooled_kv is None:
+            hidden_states_fp32 = hidden_states.float()
+            kv = self.wkv(hidden_states_fp32) if projected_kv is None else projected_kv
+            gate = self.wgate(hidden_states_fp32) if projected_gate is None else projected_gate
+            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+                kv, gate, layer_idx, "indexer_state", self.compress_ratio, start_pos
+            )
+            new_pooled = self.pool_projected(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
-                self.compress_ratio,
-                self.head_dim,
-                overlap=self.overlap,
-            ).to(input_dtype)
-        )
-        if new_pooled.shape[1] > 0:
-            positions = _rope_pool_positions(
-                new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
+                rotary,
+                start_pos=pool_base,
+                pool_position_ids=pool_position_ids,
             )
-            cos, sin = rotary(new_pooled, positions)
-            new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
-        pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
+            pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
+        else:
+            pooled_kv = precomputed_pooled_kv
 
-        cos, sin = position_embeddings
-        q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        query_hidden_states = hidden_states if query_hidden_states is None else query_hidden_states
+        query_q_residual = q_residual if query_q_residual is None else query_q_residual
+        query_position_embeddings = position_embeddings if query_position_embeddings is None else query_position_embeddings
+        if query_q_residual is None:
+            raise ValueError("DeepSeek V4 indexer requires q_residual for query scoring")
+
+        batch = pooled_kv.shape[0]
+        query_len = query_hidden_states.shape[1]
+        cos, sin = query_position_embeddings
+        q = self.wq_b(query_q_residual).view(batch, query_len, self.n_heads, self.head_dim).transpose(1, 2)
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
-        weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
-        index_scores = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=self.compress_ratio,
-            softmax_scale=self.softmax_scale,
-            backend=_dsv4_kernel_backend(self.backend),
-        )
         topk = min(self.index_topk, pooled_kv.shape[1])
-        return index_scores.topk(topk, dim=-1).indices
+        if topk <= 0:
+            return torch.empty(batch, query_len, 0, dtype=torch.int32, device=pooled_kv.device)
+        weights = self.weights_proj(query_hidden_states).float() * (self.n_heads**-0.5)
+        dense_score_elements = batch * query_len * pooled_kv.shape[1]
+        use_streaming_topk = streaming_topk or dense_score_elements > 16_777_216 or query_start != 0
+        if use_streaming_topk:
+            with torch.no_grad():
+                return streaming_indexer_topk_indices_torch(
+                    q,
+                    pooled_kv,
+                    weights,
+                    topk=topk,
+                    compress_ratio=self.compress_ratio,
+                    softmax_scale=self.softmax_scale,
+                    query_start=query_start,
+                    query_positions=query_positions,
+                    query_seq_ids=query_seq_ids,
+                    pooled_seq_ids=pooled_seq_ids,
+                    pooled_seq_positions=pooled_seq_positions,
+                    query_sample_positions=query_sample_positions,
+                    query_block_size=self.topk_query_block_size,
+                    key_block_size=self.topk_key_block_size,
+                )
+        with torch.no_grad():
+            index_scores = dsv4_indexer_scores(
+                q,
+                pooled_kv,
+                weights,
+                compress_ratio=self.compress_ratio,
+                softmax_scale=self.softmax_scale,
+                backend=_dsv4_kernel_backend(self.backend),
+                query_start=query_start,
+                query_positions=query_positions,
+                query_seq_ids=query_seq_ids,
+                pooled_seq_ids=pooled_seq_ids,
+                pooled_seq_positions=pooled_seq_positions,
+                query_sample_positions=query_sample_positions,
+            )
+            return index_scores.topk(topk, dim=-1).indices.to(torch.int32)
 
 
 class DeepseekV4Compressor(nn.Module):
@@ -700,6 +1169,29 @@ class DeepseekV4Compressor(nn.Module):
     def ape(self) -> torch.Tensor:
         return self.ape_param()
 
+    def pool_projected(
+        self,
+        kv: torch.Tensor,
+        gate: torch.Tensor,
+        rotary: nn.Module,
+        *,
+        start_pos: int,
+        pool_position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _pool_projected_windows(
+            kv,
+            gate,
+            self.ape_param(kv),
+            self.kv_norm,
+            rotary,
+            ratio=self.compress_ratio,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            overlap=self.overlap,
+            start_pos=start_pos,
+            pool_position_ids=pool_position_ids,
+        )
+
     def _set_hca_param_sync_group(self, process_group) -> None:
         self._hca_param_sync_group = process_group
 
@@ -730,54 +1222,63 @@ class DeepseekV4Compressor(nn.Module):
         cache: DeepseekV4TrainCache,
         layer_idx: int,
         start_pos: int,
+        indexer_query_hidden_states: torch.Tensor | None = None,
+        indexer_q_residual: torch.Tensor | None = None,
+        indexer_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        indexer_query_start: int = 0,
+        indexer_query_positions: torch.Tensor | None = None,
+        streaming_indexer_topk: bool = False,
+        projected_kv: torch.Tensor | None = None,
+        projected_gate: torch.Tensor | None = None,
+        indexer_projected_kv: torch.Tensor | None = None,
+        indexer_projected_gate: torch.Tensor | None = None,
+        precomputed_pooled: torch.Tensor | None = None,
+        indexer_precomputed_pooled: torch.Tensor | None = None,
+        pool_position_ids: torch.Tensor | None = None,
+        indexer_pool_position_ids: torch.Tensor | None = None,
+        indexer_query_seq_ids: torch.Tensor | None = None,
+        indexer_pooled_seq_ids: torch.Tensor | None = None,
+        indexer_pooled_seq_positions: torch.Tensor | None = None,
+        indexer_query_sample_positions: torch.Tensor | None = None,
         enable_hca_fsdp_graph_alignment: bool = False,
     ) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        batch, seq_len, _ = hidden_states.shape
-        hidden_states_fp32 = hidden_states.float()
-        kv = self.wkv(hidden_states_fp32)
-        gate = self.wgate(hidden_states_fp32)
-        ready_kv, ready_gate, pool_base = cache.accumulate_windows(
-            kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
-        )
-        local_has_complete_hca_window = ready_kv.shape[1] > 0
-        fsdp_group_has_complete_hca_window = (
-            self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
-            if enable_hca_fsdp_graph_alignment
-            else local_has_complete_hca_window
-        )
-        needs_masked_synthetic_hca_window = (
-            enable_hca_fsdp_graph_alignment
-            and self.indexer is None
-            and fsdp_group_has_complete_hca_window
-            and not local_has_complete_hca_window
-            and 0 < kv.shape[1] < self.compress_ratio
-        )
-        if needs_masked_synthetic_hca_window:
-            # A mixed short/long HCA parameter sync group needs every rank to
-            # create the same compressor autograd edges. All-short groups keep
-            # the original no-HCA path so optimizer semantics stay at
-            # grad=None. Zero-length local HCA inputs are outside this narrow
-            # training fix.
-            pad_len = self.compress_ratio - kv.shape[1]
-            pad_shape = (batch, pad_len, kv.shape[-1])
-            ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
-            ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
-            pool_base = max(0, start_pos)
-        new_pooled = self.kv_norm(
-            _pool_windows(
+        if precomputed_pooled is None:
+            batch, _, _ = hidden_states.shape
+            hidden_states_fp32 = hidden_states.float()
+            kv = self.wkv(hidden_states_fp32) if projected_kv is None else projected_kv
+            gate = self.wgate(hidden_states_fp32) if projected_gate is None else projected_gate
+            ready_kv, ready_gate, pool_base = cache.accumulate_windows(
+                kv, gate, layer_idx, "compressor_state", self.compress_ratio, start_pos
+            )
+            local_has_complete_hca_window = ready_kv.shape[1] > 0
+            fsdp_group_has_complete_hca_window = (
+                self._compute_fsdp_group_has_complete_hca_window(local_has_complete_hca_window, kv.device)
+                if enable_hca_fsdp_graph_alignment
+                else local_has_complete_hca_window
+            )
+            needs_masked_synthetic_hca_window = (
+                enable_hca_fsdp_graph_alignment
+                and self.indexer is None
+                and fsdp_group_has_complete_hca_window
+                and not local_has_complete_hca_window
+                and 0 < kv.shape[1] < self.compress_ratio
+            )
+            if needs_masked_synthetic_hca_window:
+                pad_len = self.compress_ratio - kv.shape[1]
+                pad_shape = (batch, pad_len, kv.shape[-1])
+                ready_kv = torch.cat([kv, kv.new_zeros(pad_shape)], dim=1)
+                ready_gate = torch.cat([gate, gate.new_zeros(pad_shape)], dim=1)
+                pool_base = max(0, start_pos)
+            new_pooled = self.pool_projected(
                 ready_kv,
                 ready_gate,
-                self.ape_param(hidden_states_fp32),
-                self.compress_ratio,
-                self.head_dim,
-                overlap=self.overlap,
-            ).to(input_dtype)
-        )
-        positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
-        cos, sin = rotary(new_pooled, positions)
-        new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
-        pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
+                rotary,
+                start_pos=pool_base,
+                pool_position_ids=pool_position_ids,
+            )
+            pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
+        else:
+            pooled = precomputed_pooled.unsqueeze(1)
 
         # Indexer narrows the attended compressed positions per query.  The
         # caller (DSV4Attention) is responsible for turning ``indexer_topk``
@@ -796,9 +1297,76 @@ class DeepseekV4Compressor(nn.Module):
         # or ``-1`` for "do not attend" (masked by causality).
         indexer_topk: torch.LongTensor | None = None
         if self.indexer is not None:
-            raw_topk = self.indexer(hidden_states, q_residual, rotary, position_embeddings, cache, layer_idx, start_pos)
-            threshold = (torch.arange(1, seq_len + 1, device=raw_topk.device) // self.compress_ratio).unsqueeze(1)
-            causal_invalid = raw_topk >= threshold
+            raw_topk = self.indexer(
+                hidden_states,
+                q_residual,
+                rotary,
+                position_embeddings,
+                cache,
+                layer_idx,
+                start_pos,
+                query_hidden_states=indexer_query_hidden_states,
+                query_q_residual=indexer_q_residual,
+                query_position_embeddings=indexer_position_embeddings,
+                query_start=indexer_query_start,
+                query_positions=indexer_query_positions,
+                streaming_topk=streaming_indexer_topk,
+                projected_kv=indexer_projected_kv,
+                projected_gate=indexer_projected_gate,
+                precomputed_pooled_kv=indexer_precomputed_pooled,
+                pool_position_ids=indexer_pool_position_ids,
+                query_seq_ids=indexer_query_seq_ids,
+                pooled_seq_ids=indexer_pooled_seq_ids,
+                pooled_seq_positions=indexer_pooled_seq_positions,
+                query_sample_positions=indexer_query_sample_positions,
+            )
+            query_len = raw_topk.shape[1]
+            if indexer_query_positions is None:
+                query_positions = torch.arange(
+                    indexer_query_start + 1,
+                    indexer_query_start + query_len + 1,
+                    device=raw_topk.device,
+                )
+                threshold = (query_positions // self.compress_ratio).unsqueeze(1)
+            else:
+                query_positions = indexer_query_positions.to(device=raw_topk.device, dtype=torch.int64)
+                if query_positions.numel() != query_len:
+                    raise ValueError(
+                        "indexer_query_positions length must match indexer query length "
+                        f"(got {query_positions.numel()} vs {query_len})"
+                    )
+                threshold = ((query_positions + 1) // self.compress_ratio).unsqueeze(1)
+            if indexer_pooled_seq_ids is not None:
+                if indexer_query_seq_ids is not None:
+                    query_local_positions = packed_query_positions(
+                        indexer_query_seq_ids.to(device=raw_topk.device, dtype=torch.int64),
+                        indexer_query_sample_positions,
+                    )
+                    threshold = ((query_local_positions + 1) // self.compress_ratio).unsqueeze(-1)
+                pooled_seq_ids_for_topk = indexer_pooled_seq_ids.to(device=raw_topk.device, dtype=torch.int64)
+                pooled_positions = resolve_pooled_seq_positions(
+                    pooled_seq_ids_for_topk,
+                    indexer_pooled_seq_positions,
+                )
+                safe_topk = raw_topk.clamp(min=0, max=max(pooled_positions.shape[1] - 1, 0)).to(torch.int64)
+                topk_positions = torch.gather(
+                    pooled_positions.unsqueeze(1).expand(-1, query_len, -1),
+                    dim=-1,
+                    index=safe_topk,
+                )
+                threshold_for_topk = threshold if threshold.dim() == 3 else threshold.unsqueeze(0)
+                causal_invalid = (raw_topk < 0) | (topk_positions < 0) | (topk_positions >= threshold_for_topk)
+                if indexer_query_seq_ids is not None:
+                    pooled_seq_ids = pooled_seq_ids_for_topk
+                    query_seq_ids = indexer_query_seq_ids.to(device=raw_topk.device, dtype=torch.int64)
+                    topk_seq_ids = torch.gather(
+                        pooled_seq_ids.unsqueeze(1).expand(-1, query_len, -1),
+                        dim=-1,
+                        index=safe_topk,
+                    )
+                    causal_invalid = causal_invalid | (topk_seq_ids != query_seq_ids.unsqueeze(-1))
+            else:
+                causal_invalid = raw_topk >= threshold
             indexer_topk = torch.where(causal_invalid, torch.full_like(raw_topk, -1), raw_topk)
         return pooled, indexer_topk
 
@@ -974,6 +1542,7 @@ class DeepseekV4Attention(nn.Module):
         )
         self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks_param = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
+        self._cp_mesh = None
 
         self.compressor = (
             DeepseekV4Compressor(config, self.compress_ratio, self.head_dim, backend=self.backend)
@@ -992,11 +1561,26 @@ class DeepseekV4Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_embeddings_compress: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_compress: nn.Module | None = None,
+        position_ids: torch.Tensor | None = None,
         start_pos: int = 0,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        del kwargs
         batch, seq_len = hidden_states.shape[:2]
+        attn_backend = _dsv4_kernel_backend(self.backend)
+        cp_mesh = getattr(self, "_cp_mesh", None)
+        cp_enabled = _cp_mesh_enabled(cp_mesh)
+        cp_layout = _dsv4_cp_layout(kwargs.get("dsv4_cp_layout", None))
+        cp_zigzag = cp_enabled and _cp_layout_is_zigzag(cp_layout)
+        if cp_enabled and attn_backend != "tilelang":
+            raise NotImplementedError("DeepSeek V4 manual CP currently requires backend.attn='tilelang'.")
+
+        packed_seq_ids = kwargs.get("dsv4_seq_ids", kwargs.get("seq_ids", None))
+        token_positions = kwargs.get("dsv4_token_positions", None)
+        packed_sequence = isinstance(packed_seq_ids, torch.Tensor)
+        if not isinstance(token_positions, torch.Tensor):
+            token_positions = None
+        packed_query_sample_positions = position_ids if packed_sequence and isinstance(position_ids, torch.Tensor) else None
+
         # IMPORTANT: for compress_ratio>0 layers the released DSV4-Flash uses
         # the compress-rope (theta=160000 + YaRN) for the MAIN attention Q/KV
         # too, NOT just for the compressor sub-module.  Reference at
@@ -1021,24 +1605,173 @@ class DeepseekV4Attention(nn.Module):
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
-        full_kv = kv
+        raw_key_start = 0
+        query_positions = None
+        query_key_positions = None
+        query_seq_ids = packed_seq_ids if packed_sequence else None
+        raw_key_seq_ids = None
+        raw_key_sample_positions = None
+        full_packed_seq_ids = None
+        full_pool_position_ids = None
+
+        if cp_enabled:
+            cp_rank = _cp_mesh_rank(cp_mesh)
+            query_start = cp_rank * (seq_len // 2 if cp_zigzag else seq_len)
+            query_positions = _query_positions_1d(position_ids, seq_len, kv.device, query_start)
+            query_token_positions = (
+                _query_positions_1d(token_positions, seq_len, kv.device, query_start)
+                if token_positions is not None
+                else None
+            )
+            full_kv, raw_key_start = _cp_gather_sliding_window_kv(
+                kv,
+                cp_mesh,
+                self.sliding_window,
+                cp_layout=cp_layout,
+            )
+            if packed_sequence:
+                raw_key_seq_ids, _ = _cp_gather_sliding_window_metadata(
+                    packed_seq_ids,
+                    cp_mesh,
+                    self.sliding_window,
+                    cp_layout=cp_layout,
+                )
+                raw_key_sample_positions, _ = _cp_gather_sliding_window_metadata(
+                    position_ids,
+                    cp_mesh,
+                    self.sliding_window,
+                    cp_layout=cp_layout,
+                )
+                full_packed_seq_ids = _gather_full_cp_metadata(packed_seq_ids, cp_mesh, cp_layout=cp_layout)
+                full_pool_position_ids = _gather_full_cp_metadata(position_ids, cp_mesh, cp_layout=cp_layout)
+            query_key_positions = (query_token_positions if query_token_positions is not None else query_positions) - raw_key_start
+        else:
+            query_start = _first_position(position_ids, 0)
+            full_kv = kv
+            if packed_sequence:
+                raw_key_seq_ids = packed_seq_ids
+                raw_key_sample_positions = position_ids
+                full_packed_seq_ids = packed_seq_ids
+                full_pool_position_ids = position_ids
+                if token_positions is not None:
+                    query_key_positions = _query_positions_1d(token_positions, seq_len, kv.device, query_start)
+
         n_pooled = 0
         indexer_topk: torch.LongTensor | None = None
+        compressor_pooled_seq_ids = None
+        compressor_pooled_seq_positions = None
 
         if self.compressor is not None:
             assert rotary_compress is not None and position_embeddings_compress is not None, (
                 "DeepseekV4Attention: compressor enabled but no rotary_compress / "
                 "position_embeddings_compress supplied by the Block/Model."
             )
+            compressor_projected_kv = None
+            compressor_projected_gate = None
+            indexer_projected_kv = None
+            indexer_projected_gate = None
+            compressor_precomputed_pooled = None
+            indexer_precomputed_pooled = None
+            compressor_pool_position_ids = full_pool_position_ids if packed_sequence else None
+            indexer_pool_position_ids = full_pool_position_ids if packed_sequence else None
+            indexer_pooled_seq_ids = (
+                _pool_seq_ids(
+                    full_packed_seq_ids,
+                    self.compressor.indexer.compress_ratio,
+                    overlap=self.compressor.indexer.overlap,
+                )
+                if packed_sequence and self.compressor.indexer is not None
+                else None
+            )
+            indexer_pooled_seq_positions = (
+                _pool_position_ordinals(
+                    full_pool_position_ids,
+                    self.compressor.indexer.compress_ratio,
+                    pooled_seq_ids=indexer_pooled_seq_ids,
+                )
+                if packed_sequence and self.compressor.indexer is not None
+                else None
+            )
+
+            if cp_enabled:
+                compressor_hidden_states = hidden_states
+                if not packed_sequence:
+                    compressor_precomputed_pooled = _cp_pool_projected_and_gather(
+                        hidden_states,
+                        self.compressor,
+                        rotary_compress,
+                        cp_mesh,
+                        query_start,
+                        cp_layout=cp_layout,
+                    )
+                if compressor_precomputed_pooled is None:
+                    hidden_states_fp32 = hidden_states.float()
+                    compressor_local_kv = self.compressor.wkv(hidden_states_fp32)
+                    compressor_local_gate = self.compressor.wgate(hidden_states_fp32)
+                    if cp_zigzag:
+                        compressor_projected_kv = _cp_all_gather_zigzag_halves(compressor_local_kv, cp_mesh, dim=1)
+                        compressor_projected_gate = _cp_all_gather_zigzag_halves(compressor_local_gate, cp_mesh, dim=1)
+                    else:
+                        compressor_projected_kv = _cp_all_gather(compressor_local_kv, cp_mesh, dim=1)
+                        compressor_projected_gate = _cp_all_gather(compressor_local_gate, cp_mesh, dim=1)
+                if self.compressor.indexer is not None:
+                    if not packed_sequence:
+                        indexer_precomputed_pooled = _cp_pool_projected_and_gather(
+                            hidden_states,
+                            self.compressor.indexer,
+                            rotary_compress,
+                            cp_mesh,
+                            query_start,
+                            cp_layout=cp_layout,
+                        )
+                    if indexer_precomputed_pooled is None:
+                        hidden_states_fp32 = hidden_states.float()
+                        indexer_local_kv = self.compressor.indexer.wkv(hidden_states_fp32)
+                        indexer_local_gate = self.compressor.indexer.wgate(hidden_states_fp32)
+                        if cp_zigzag:
+                            indexer_projected_kv = _cp_all_gather_zigzag_halves(indexer_local_kv, cp_mesh, dim=1)
+                            indexer_projected_gate = _cp_all_gather_zigzag_halves(indexer_local_gate, cp_mesh, dim=1)
+                        else:
+                            indexer_projected_kv = _cp_all_gather(indexer_local_kv, cp_mesh, dim=1)
+                            indexer_projected_gate = _cp_all_gather(indexer_local_gate, cp_mesh, dim=1)
+                position_embeddings_compress_for_compressor = position_embeddings_compress
+                indexer_hidden_states = hidden_states
+                indexer_q_residual = q_residual
+                indexer_position_embeddings = position_embeddings_compress
+            else:
+                compressor_hidden_states = hidden_states
+                position_embeddings_compress_for_compressor = position_embeddings_compress
+                indexer_hidden_states = hidden_states
+                indexer_q_residual = q_residual
+                indexer_position_embeddings = position_embeddings_compress
+
             cache = DeepseekV4TrainCache()
             pooled, indexer_topk = self.compressor(
-                hidden_states,
+                compressor_hidden_states,
                 q_residual=q_residual,
                 rotary=rotary_compress,
-                position_embeddings=position_embeddings_compress,
+                position_embeddings=position_embeddings_compress_for_compressor,
                 cache=cache,
                 layer_idx=self.layer_idx,
                 start_pos=start_pos,
+                indexer_query_hidden_states=indexer_hidden_states,
+                indexer_q_residual=indexer_q_residual,
+                indexer_position_embeddings=indexer_position_embeddings,
+                indexer_query_start=query_start,
+                indexer_query_positions=query_positions,
+                streaming_indexer_topk=cp_enabled,
+                projected_kv=compressor_projected_kv,
+                projected_gate=compressor_projected_gate,
+                indexer_projected_kv=indexer_projected_kv,
+                indexer_projected_gate=indexer_projected_gate,
+                precomputed_pooled=compressor_precomputed_pooled,
+                indexer_precomputed_pooled=indexer_precomputed_pooled,
+                pool_position_ids=compressor_pool_position_ids if compressor_precomputed_pooled is None else None,
+                indexer_pool_position_ids=indexer_pool_position_ids if indexer_precomputed_pooled is None else None,
+                indexer_query_seq_ids=query_seq_ids,
+                indexer_pooled_seq_ids=indexer_pooled_seq_ids,
+                indexer_pooled_seq_positions=indexer_pooled_seq_positions,
+                indexer_query_sample_positions=packed_query_sample_positions,
                 # Only DeepSeek-V4 HCA (ratio 128) needs this FSDP graph alignment.
                 # Ratio 4 uses the Indexer/SCA path and is outside this fix.
                 # Direct attention calls without an explicit mask keep the
@@ -1049,6 +1782,22 @@ class DeepseekV4Attention(nn.Module):
                 ),
             )
             n_pooled = pooled.shape[2]
+            compressor_pooled_seq_ids = _pool_seq_ids(
+                full_packed_seq_ids,
+                self.compress_ratio,
+                n_pooled,
+                overlap=self.compressor.overlap,
+            )
+            compressor_pooled_seq_positions = _pool_position_ordinals(
+                full_pool_position_ids,
+                self.compress_ratio,
+                n_pooled,
+                pooled_seq_ids=compressor_pooled_seq_ids,
+            )
+            if cp_enabled and attn_backend == "tilelang":
+                full_kv = _pad_raw_kv_before_compressed_for_tilelang(full_kv)
+                raw_key_seq_ids = _pad_metadata_to_len(raw_key_seq_ids, full_kv.shape[2], value=-1)
+                raw_key_sample_positions = _pad_metadata_to_len(raw_key_sample_positions, full_kv.shape[2], value=-1)
             full_kv = torch.cat([full_kv, pooled], dim=2)
 
             # Extend the additive 4D attention mask with a per-query
@@ -1072,15 +1821,36 @@ class DeepseekV4Attention(nn.Module):
                     # is unspecified, so use count-then-threshold instead.
                     compressed_mask = _build_indexer_topk_compressed_mask(attention_mask, indexer_topk, n_pooled)
                 else:
-                    q_pos = torch.arange(seq_len, device=full_kv.device)
                     p_pos = torch.arange(n_pooled, device=full_kv.device)
-                    threshold = (q_pos + 1) // self.compress_ratio
-                    allowed = p_pos.unsqueeze(0) < threshold.unsqueeze(1)  # [S, P]
+                    if query_seq_ids is not None and compressor_pooled_seq_ids is not None:
+                        pooled_seq_ids_for_mask = compressor_pooled_seq_ids.to(device=full_kv.device, dtype=torch.int64)
+                        pooled_positions = resolve_pooled_seq_positions(
+                            pooled_seq_ids_for_mask,
+                            compressor_pooled_seq_positions,
+                        )
+                        query_local_positions = packed_query_positions(
+                            query_seq_ids.to(device=full_kv.device, dtype=torch.int64),
+                            packed_query_sample_positions,
+                        )
+                        threshold = ((query_local_positions + 1) // self.compress_ratio).unsqueeze(-1)
+                        allowed = (
+                            (pooled_positions.unsqueeze(1) >= 0)
+                            & (pooled_positions.unsqueeze(1) < threshold)
+                            & (pooled_seq_ids_for_mask.unsqueeze(1)
+                               == query_seq_ids.to(device=full_kv.device, dtype=torch.int64).unsqueeze(-1))
+                            & (query_seq_ids.to(device=full_kv.device, dtype=torch.int64).unsqueeze(-1) >= 0)
+                        )
+                    else:
+                        q_pos = torch.arange(seq_len, device=full_kv.device)
+                        threshold = (q_pos + 1) // self.compress_ratio
+                        allowed = p_pos.unsqueeze(0) < threshold.unsqueeze(1)  # [S, P]
                     compressed_mask = torch.where(
                         allowed,
                         torch.zeros((), dtype=attention_mask.dtype, device=full_kv.device),
                         torch.full((), min_val, dtype=attention_mask.dtype, device=full_kv.device),
-                    ).expand(batch, seq_len, n_pooled)
+                    )
+                    if compressed_mask.dim() == 2:
+                        compressed_mask = compressed_mask.expand(batch, seq_len, n_pooled)
                 compressed_mask = compressed_mask.unsqueeze(1)  # [B, 1, S, P]
                 attention_mask = torch.cat([attention_mask, compressed_mask], dim=-1)
 
@@ -1089,23 +1859,35 @@ class DeepseekV4Attention(nn.Module):
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attn_backend = _dsv4_kernel_backend(self.backend)
         if attn_backend == "tilelang":
+            q_sparse = q.to(torch.bfloat16)
+            full_kv_sparse = full_kv.to(torch.bfloat16)
             topk_idxs = build_dsv4_sparse_topk_indices(
                 batch_size=batch,
                 seq_len=seq_len,
-                key_len=full_kv.shape[2],
+                key_len=full_kv_sparse.shape[2],
                 window_size=self.sliding_window,
-                device=full_kv.device,
-                attention_mask=attention_mask,
+                device=full_kv_sparse.device,
+                attention_mask=None if cp_enabled else attention_mask,
                 compress_ratio=self.compress_ratio,
                 compressed_topk=indexer_topk,
                 n_pooled=n_pooled,
+                query_start=query_start - raw_key_start,
+                query_global_start=query_start,
+                query_positions=query_positions,
+                query_key_positions=query_key_positions,
+                raw_key_len=full_kv_sparse.shape[2] - n_pooled,
+                query_seq_ids=query_seq_ids,
+                raw_key_seq_ids=raw_key_seq_ids,
+                raw_key_sample_positions=raw_key_sample_positions,
+                pooled_seq_ids=compressor_pooled_seq_ids,
+                pooled_seq_positions=compressor_pooled_seq_positions,
+                query_sample_positions=packed_query_sample_positions,
             )
             attn_output = dsv4_sparse_attention(
-                q.transpose(1, 2).contiguous(),
-                full_kv.squeeze(1).contiguous(),
-                self.sinks_param(q),
+                q_sparse.transpose(1, 2),
+                full_kv_sparse.squeeze(1).contiguous(),
+                self.sinks_param(q_sparse),
                 topk_idxs,
                 self.scaling,
                 backend=attn_backend,

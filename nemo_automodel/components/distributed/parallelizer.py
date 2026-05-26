@@ -478,18 +478,25 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
 
 
 class DeepseekV4ParallelizationStrategy(DefaultParallelizationStrategy):
-    """DeepSeek-V4 keeps a small set of reference-sensitive parameters in fp32."""
+    """DeepSeek-V4 keeps reference-sensitive params in fp32 and records CP mesh."""
 
     def parallelize(self, model, device_mesh, dp_shard_cp_mesh_name="dp_shard_cp", **kwargs):
         from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 
-        return super().parallelize(
+        result = super().parallelize(
             model,
             device_mesh,
             dp_shard_cp_mesh_name=dp_shard_cp_mesh_name,
             fully_shard_fn=fully_shard_deepseek_v4,
             **kwargs,
         )
+        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
+        if cp_mesh_name in device_mesh.mesh_dim_names and device_mesh[cp_mesh_name].size() > 1:
+            cp_mesh = device_mesh[cp_mesh_name]
+            for _, mod in result.named_modules():
+                if type(mod).__name__ == "DeepseekV4Attention":
+                    mod._cp_mesh = cp_mesh
+        return result
 
 
 class WanParallelizationStrategy(ParallelizationStrategy):

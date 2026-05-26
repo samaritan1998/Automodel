@@ -28,10 +28,45 @@ PACK_TYPE = dict[str, torch.Tensor | list[int]]
 
 
 def _fill_labels_with_cross_entropy_ignore_idx(labels: list[int], loss_mask: list[int]) -> list[int]:
+    if len(loss_mask) != len(labels):
+        raise ValueError(f"loss_mask and labels must have the same length, got {len(loss_mask)} vs {len(labels)}")
     for i, mask in enumerate(loss_mask):
         if mask == 0:
             labels[i] = CROSS_ENTROPY_IGNORE_IDX
     return labels
+
+
+def _as_list(value) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    return list(value)
+
+
+def _trim_sample_to_attention_mask(
+    input_ids: list[int],
+    labels: list[int],
+    attention_mask,
+) -> tuple[list[int], list[int], list[int], int]:
+    """Drop right padding already present in a sample before packing."""
+    if len(labels) != len(input_ids):
+        raise ValueError(f"input_ids and labels must have the same length, got {len(input_ids)} vs {len(labels)}")
+    if attention_mask is None:
+        return input_ids, labels, [1] * len(input_ids), len(input_ids)
+
+    attention_mask = [1 if int(x) != 0 else 0 for x in _as_list(attention_mask)]
+    if len(attention_mask) < len(input_ids):
+        attention_mask = attention_mask + [0] * (len(input_ids) - len(attention_mask))
+    elif len(attention_mask) > len(input_ids):
+        attention_mask = attention_mask[: len(input_ids)]
+
+    actual_len = int(sum(attention_mask))
+    expected_mask = [1] * actual_len + [0] * (len(input_ids) - actual_len)
+    if attention_mask != expected_mask:
+        raise ValueError("Packed samples require left-contiguous attention_mask; internal padding is unsupported.")
+
+    if actual_len == 0:
+        return [], [], [], 0
+    return input_ids[:actual_len], labels[:actual_len], attention_mask[:actual_len], actual_len
 
 
 def _pad_pack(
@@ -40,6 +75,7 @@ def _pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    seq_pad_multiple: int = 1,
 ) -> PACK_TYPE:
     """
     Pads a pack to ``packed_sequence_size``.
@@ -61,17 +97,23 @@ def _pad_pack(
         (0, packed_sequence_size - len(pack["labels"])),
         value=cross_entropy_ignore_idx,
     )
+    padded_attention_mask = F.pad(
+        pack["attention_mask"],
+        (0, packed_sequence_size - len(pack["attention_mask"])),
+        value=0,
+    )
 
     # seq_lens contains original sequence lengths
     original_seq_lens = pack["seq_lens"].clone()
 
-    # seq_lens_padded: apply CP padding to each sequence, then add pack padding to last
-    if cp_size > 1:
-        cp_divisibility_factor = 2 * cp_size
-        # Apply CP padding to each sequence length
+    # seq_lens_padded applies per-sample alignment, then pack-level padding.
+    # DSV4 packed CP uses seq_pad_multiple=128 so compressor windows do not
+    # straddle packed-sample boundaries.
+    align_multiple = max(2 * cp_size if cp_size > 1 else 1, int(seq_pad_multiple or 1))
+    if align_multiple > 1:
         cp_padded_lens = []
         for seq_len in pack["seq_lens"]:
-            cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
+            cp_padded_len = ((seq_len + align_multiple - 1) // align_multiple) * align_multiple
             cp_padded_lens.append(cp_padded_len)
 
         # Convert to tensor
@@ -91,6 +133,8 @@ def _pad_pack(
     # Pad position_ids continuing the sequence from last value
     # in position_ids
     # e.g. [0 1 2] -> [0 1 2 3 4 5] for packed_sequence_size = 6
+    if len(pack["position_ids"]) == 0:
+        raise ValueError("Cannot pad an empty packed sequence. Check packed_sequence_size and seq_pad_multiple.")
     num_range = torch.arange(
         pack["position_ids"][-1] + 1,
         pack["position_ids"][-1] + packed_sequence_size - len(pack["position_ids"]) + 1,
@@ -103,6 +147,7 @@ def _pad_pack(
         "input_ids": padded_tokens,
         "labels": padded_labels,
         "position_ids": padded_position_ids,
+        "attention_mask": padded_attention_mask,
         "seq_lens": original_seq_lens,
         "seq_lens_padded": padded_seq_lens,
     }
@@ -117,6 +162,7 @@ def _convert_to_tensors(pack: PACK_TYPE) -> PACK_TYPE:
     tensor_pack = {
         "input_ids": torch.tensor(pack["input_ids"], dtype=torch.long),
         "labels": torch.tensor(pack["labels"], dtype=torch.long),
+        "attention_mask": torch.tensor(pack["attention_mask"], dtype=torch.long),
         "position_ids": torch.tensor(pack["position_ids"], dtype=torch.long),
         "seq_lens": torch.tensor(pack["seq_lens"], dtype=torch.long),
     }
@@ -129,6 +175,7 @@ def _tensorize_and_pad_pack(
     packed_sequence_size: int,
     cross_entropy_ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    seq_pad_multiple: int = 1,
 ) -> None:
     """
     converts to tensors, pads a pack and returns it.
@@ -140,6 +187,7 @@ def _tensorize_and_pad_pack(
         packed_sequence_size=packed_sequence_size,
         cross_entropy_ignore_idx=cross_entropy_ignore_idx,
         cp_size=cp_size,
+        seq_pad_multiple=seq_pad_multiple,
     )
     return pack
 
@@ -161,6 +209,7 @@ def _split_and_add_pack(
     padding_idx: int,
     cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
     cp_size: int = 1,
+    seq_pad_multiple: int = 1,
 ) -> PACK_TYPE:
     """
     Splits the current pack at the boundary, processes it, adds it to ``packs``.
@@ -172,6 +221,7 @@ def _split_and_add_pack(
     pack = {
         "input_ids": current_pack["input_ids"][:previous_sample_boundary],
         "labels": current_pack["labels"][:previous_sample_boundary],
+        "attention_mask": current_pack["attention_mask"][:previous_sample_boundary],
         "position_ids": current_pack["position_ids"][:previous_sample_boundary],
         "seq_lens": current_pack["seq_lens"][:-1],
     }
@@ -184,6 +234,7 @@ def _split_and_add_pack(
             packed_sequence_size=packed_sequence_size,
             cross_entropy_ignore_idx=cross_entropy_ignore_idx,
             cp_size=cp_size,
+            seq_pad_multiple=seq_pad_multiple,
         )
     )
 
@@ -193,6 +244,7 @@ def _split_and_add_pack(
     output_dict = {
         "input_ids": current_pack["input_ids"][previous_sample_boundary:],
         "labels": current_pack["labels"][previous_sample_boundary:],
+        "attention_mask": current_pack["attention_mask"][previous_sample_boundary:],
         "position_ids": current_pack["position_ids"][previous_sample_boundary:],
         "seq_lens": [next_seq_len],
     }
@@ -207,6 +259,7 @@ def pack_dataset(
     padding_idx=0,
     drop_long_samples=True,
     cp_size=1,
+    seq_pad_multiple: int = 1,
 ):
     """
     Pack the dataset to defined length.
@@ -235,23 +288,37 @@ def pack_dataset(
     current_pack = {
         "input_ids": [],
         "labels": [],
+        "attention_mask": [],
         "position_ids": [],
         "seq_lens": [],
     }
     previous_sample_boundary: int = 0
     logged_drop_long_samples = False
 
-    # Calculate CP divisibility factor
-    cp_divisibility_factor = 2 * cp_size if cp_size > 1 else 1
+    # Calculate per-sample alignment. DSV4 packed CP sets seq_pad_multiple=128
+    # so compressed/indexer windows cannot straddle two packed samples.
+    cp_divisibility_factor = max(2 * cp_size if cp_size > 1 else 1, int(seq_pad_multiple or 1))
+    if cp_divisibility_factor > 1 and packed_sequence_size % cp_divisibility_factor != 0:
+        raise ValueError(
+            f"packed_sequence_size ({packed_sequence_size}) must be divisible by the per-sample alignment "
+            f"({cp_divisibility_factor}). Adjust packed_sequence_size or seq_pad_multiple."
+        )
 
     for sample in dataset:
-        input_ids, labels = sample["input_ids"], sample["labels"]
-        if loss_mask := sample.pop("loss_mask", None):
-            labels = _fill_labels_with_cross_entropy_ignore_idx(labels, loss_mask)
+        input_ids, labels = _as_list(sample["input_ids"]), _as_list(sample["labels"])
+        loss_mask = sample.get("loss_mask", None)
+        if loss_mask is not None:
+            labels = _fill_labels_with_cross_entropy_ignore_idx(labels, _as_list(loss_mask))
+        input_ids, labels, attention_mask, seq_len = _trim_sample_to_attention_mask(
+            input_ids,
+            labels,
+            sample.get("attention_mask"),
+        )
+        if seq_len == 0:
+            continue
         # If the dataset outputs samples that are larger than the specified
         # packed_sequence_size and we're unable to split it, user needs to modify
         # one of the two parameters
-        seq_len = len(input_ids)
         if drop_long_samples and seq_len > packed_sequence_size:
             if not logged_drop_long_samples:
                 logged_drop_long_samples = True
@@ -264,9 +331,8 @@ def pack_dataset(
                 "Please increase `packed_sequence_size`.",
             )
 
-        # Apply CP padding if needed
-        if cp_size > 1:
-            # Pad sequence to be divisible by 2*cp_size
+        # Apply per-sample padding if needed.
+        if cp_divisibility_factor > 1:
             cp_padded_len = ((seq_len + cp_divisibility_factor - 1) // cp_divisibility_factor) * cp_divisibility_factor
             cp_padding_amount = cp_padded_len - seq_len
 
@@ -274,11 +340,29 @@ def pack_dataset(
                 # Add padding tokens
                 input_ids = input_ids + [padding_idx] * cp_padding_amount
                 labels = labels + [CROSS_ENTROPY_IGNORE_IDX] * cp_padding_amount
+        padded_seq_len = len(input_ids)
+        if drop_long_samples and padded_seq_len > packed_sequence_size:
+            if not logged_drop_long_samples:
+                logged_drop_long_samples = True
+                logger.info(
+                    "Dataset has samples whose aligned length exceeds %s; they will be skipped",
+                    packed_sequence_size,
+                )
+            continue
+
+        if padded_seq_len > packed_sequence_size:
+            raise ValueError(
+                f"Dataset sample is too long after alignment ({padded_seq_len} > {packed_sequence_size}; "
+                f"original length {seq_len}, alignment {cp_divisibility_factor}). "
+                "Increase `packed_sequence_size` or reduce `seq_pad_multiple`."
+            )
+        attention_mask = attention_mask + [0] * (len(input_ids) - len(attention_mask))
 
         # Update the current pack
         # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
         current_pack["input_ids"] += input_ids
         current_pack["labels"] += labels
+        current_pack["attention_mask"] += attention_mask
         # Position IDs should continue for the actual length (including CP padding)
         current_pack["position_ids"] += [x % packed_sequence_size for x in range(len(input_ids))]
         # Always store original length in seq_lens
@@ -295,6 +379,7 @@ def pack_dataset(
                 padding_idx=padding_idx,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                seq_pad_multiple=seq_pad_multiple,
             )
 
         # Keep track of previous sample boundary
@@ -313,6 +398,7 @@ def pack_dataset(
                 packed_sequence_size=packed_sequence_size,
                 cross_entropy_ignore_idx=CROSS_ENTROPY_IGNORE_IDX,
                 cp_size=cp_size,
+                seq_pad_multiple=seq_pad_multiple,
             )
         )
 
