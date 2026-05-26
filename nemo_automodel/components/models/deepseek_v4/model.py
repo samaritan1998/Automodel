@@ -74,6 +74,12 @@ from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
+def _unwrap_checkpoint_wrapper(module):
+    while hasattr(module, "_checkpoint_wrapped_module"):
+        module = module._checkpoint_wrapped_module
+    return module
+
+
 @dataclass
 class DeepseekV4CausalLMOutput:
     """Output of DeepseekV4ForCausalLM.forward.
@@ -297,8 +303,13 @@ class DeepseekV4HashGate(nn.Module):
         if input_ids is not None:
             indices = self.tid2eid[input_ids.flatten().to(torch.int64)]
         else:
-            # Fallback to score-based topk — keeps the module usable in tests or
-            # PP stages where input_ids is not threaded through.
+            if self.training:
+                raise ValueError(
+                    "DeepSeek V4 hash-routing layers require input_ids during training. "
+                    "Ensure all layer_idx < num_hash_layers live on the first PP stage, "
+                    "or pass input_ids through the pipeline stage that owns the hash layer."
+                )
+            # Eval fallback keeps standalone inspection usable when input_ids is absent.
             indices = scores.topk(self.topk, dim=-1)[1]
 
         weights = scores.gather(1, indices.long())
@@ -455,26 +466,32 @@ class DeepseekV4Model(nn.Module):
         # layer in the released DSV4-Flash was trained under it.
         sliding_window = int(getattr(self.config, "sliding_window", 0) or 0) or None
         packed_seq_lens = None
-        attention_mask_4d = None
-        attention_mask_ready = False
+        packed_seq_ids = attn_kwargs.get(
+            "dsv4_seq_ids",
+            attn_kwargs.get("seq_ids", attn_kwargs.get("_packed_seq_ids")),
+        )
         if (
             attn_kwargs.get("dsv4_cp_size", 1) > 1
+            and attn_kwargs.get("qkv_format") == "thd"
+            and not isinstance(packed_seq_ids, torch.Tensor)
+        ):
+            raise ValueError("DeepSeek V4 manual CP with THD packing requires seq_ids/dsv4_seq_ids metadata")
+        use_sparse_cp_mask = (
+            attn_kwargs.get("dsv4_cp_size", 1) > 1
             and getattr(getattr(self, "backend", None), "attn", None) == "tilelang"
-        ):
+        )
+        if use_sparse_cp_mask:
+            # DSV4 CP uses sparse top-k metadata in DeepseekV4Attention. Building
+            # a dense [B, 1, S_local, S_global] mask would defeat 128K training.
             attention_mask_4d = None
-            attention_mask_ready = True
-        elif attn_kwargs.get("qkv_format") == "thd" and isinstance(
-            attn_kwargs.get("dsv4_seq_ids", attn_kwargs.get("seq_ids")),
-            torch.Tensor,
-        ):
+        elif attn_kwargs.get("qkv_format") == "thd" and isinstance(packed_seq_ids, torch.Tensor):
             attention_mask_4d = build_packed_causal_padding_mask_from_seq_ids(
-                attn_kwargs.get("dsv4_seq_ids", attn_kwargs.get("seq_ids")),
+                packed_seq_ids,
                 seq_len=shape_ref.shape[1],
                 dtype=shape_ref.dtype,
                 device=shape_ref.device,
                 sliding_window=sliding_window,
             )
-            attention_mask_ready = True
         elif attn_kwargs.get("qkv_format") == "thd":
             # THD packing uses seq_lens_padded to keep pack/CP padding inside a
             # valid block. Using only seq_lens leaves trailing pad query rows
@@ -482,24 +499,27 @@ class DeepseekV4Model(nn.Module):
             packed_seq_lens = attn_kwargs.get("seq_lens_padded")
             if packed_seq_lens is None:
                 packed_seq_lens = attn_kwargs.get("seq_lens")
-        if not attention_mask_ready:
-            if packed_seq_lens is not None:
-                attention_mask_4d = build_packed_causal_padding_mask(
-                    packed_seq_lens,
-                    seq_len=shape_ref.shape[1],
-                    dtype=shape_ref.dtype,
-                    device=shape_ref.device,
-                    sliding_window=sliding_window,
-                )
-            else:
-                attention_mask_4d = build_causal_padding_mask(
-                    attention_mask,
-                    seq_len=shape_ref.shape[1],
-                    dtype=shape_ref.dtype,
-                    device=shape_ref.device,
-                    batch_size=shape_ref.shape[0],
-                    sliding_window=sliding_window,
-                )
+        else:
+            attention_mask_4d = build_causal_padding_mask(
+                attention_mask,
+                seq_len=shape_ref.shape[1],
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                batch_size=shape_ref.shape[0],
+                sliding_window=sliding_window,
+            )
+
+        if packed_seq_lens is not None:
+            attention_mask_4d = build_packed_causal_padding_mask(
+                packed_seq_lens,
+                seq_len=shape_ref.shape[1],
+                dtype=shape_ref.dtype,
+                device=shape_ref.device,
+                sliding_window=sliding_window,
+            )
+
+        if padding_mask is None and isinstance(packed_seq_ids, torch.Tensor):
+            padding_mask = packed_seq_ids.to(device=shape_ref.device).lt(0)
 
         # ``input_ids`` is only meaningful for hash-routing layers, which live
         # on stage 0 (num_hash_layers <= layers per stage 0).  Mid-stages pass
@@ -546,8 +566,10 @@ class DeepseekV4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block = _unwrap_checkpoint_wrapper(block)
+                mlp = _unwrap_checkpoint_wrapper(getattr(block, "mlp", None))
+                if isinstance(mlp, MoE):
+                    mlp.gate.update_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -772,8 +794,22 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
 
         thd_mode = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        seq_ids = attn_kwargs.get("dsv4_seq_ids", None)
+        if seq_ids is None:
+            seq_ids = attn_kwargs.get("seq_ids", None)
+        if seq_ids is None:
+            seq_ids = attn_kwargs.get("_packed_seq_ids", None)
+        packed_sequence = thd_mode or isinstance(seq_ids, torch.Tensor)
 
         use_mtp = self.mtp is not None and self.training
+        if self.training and self.mtp_config.enabled and (
+            int(attn_kwargs.get("dsv4_cp_size", 1) or 1) > 1 or packed_sequence
+        ):
+            raise ValueError(
+                "DeepSeek V4 MTP is not supported with manual CP or sequence packing yet because "
+                "next-token embedding/label roll must respect CP shard and packed-sample boundaries. "
+                "Set num_nextn_predict_layers=0 for DSV4 CP/packing training."
+            )
         model_out = self.model(
             input_ids,
             position_ids=position_ids,

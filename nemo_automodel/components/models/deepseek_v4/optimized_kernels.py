@@ -103,14 +103,23 @@ def _env_positive_int(name: str, default: int) -> int:
 
 
 def _normalize_sparse_attn_head_chunk(total_heads: int, requested_heads: int) -> int:
+    """Pick a TileLang sparse-attention head chunk that does not create ragged tiles.
+
+    The vendored TileLang kernel pads the head tile to at least 16 lanes. Using
+    8-head chunks with TP=1 creates underfilled head tiles and has been observed
+    to hang on long DSV4 CP shapes. Prefer power-of-two chunks that divide the
+    local head count.
+    """
     if total_heads <= 16:
         return total_heads
+
     candidates = [16, 32, 64]
     valid = [heads for heads in candidates if heads <= total_heads and total_heads % heads == 0]
     if not valid:
         return total_heads
     if requested_heads in valid:
         return requested_heads
+
     smaller_or_equal = [heads for heads in valid if heads <= requested_heads]
     if smaller_or_equal:
         return max(smaller_or_equal)
@@ -121,9 +130,9 @@ def _pad_sparse_attn_kv_for_tilelang(kv: torch.Tensor, multiple: int = 64) -> to
     """Pad KV length for TileLang sparse-attention shape stability.
 
     The sparse-attention kernel only reads keys listed in ``topk_idxs``. Under
-    CP, nonzero ranks can expose sliding-window KV lengths that are not
-    tile-aligned; padding KV avoids TileLang shape hangs without changing
-    attention semantics.
+    CP, nonzero ranks can expose sliding-window KV lengths such as 8319 or
+    41087 that are not tile-aligned; padding KV to a 64 boundary avoids
+    TileLang runtime hangs without changing attention semantics.
     """
     if multiple <= 1:
         return kv
@@ -167,9 +176,14 @@ def _should_use_tilelang(
 
     if backend == "tilelang" and not can_run:
         requirement = "CUDA bfloat16 tensors" if require_bf16 else "CUDA tensors"
+        tensor_specs = ", ".join(
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} is_cuda={tensor.is_cuda}"
+            for tensor in tensors
+        )
         raise RuntimeError(
             f"dsv4 {kernel_name} TileLang backend was requested, but the optional kernel is unavailable "
-            f"or inputs do not satisfy {requirement}."
+            f"or inputs do not satisfy {requirement}. "
+            f"available={available}; tensors=[{tensor_specs}]"
         )
     return backend == "tilelang" or (backend == "auto" and can_run)
 
@@ -185,13 +199,7 @@ def sinkhorn_normalize_torch(x: torch.Tensor, repeat: int, eps: float) -> torch.
 
 
 class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
-    """TileKernels Sinkhorn wrapper that accepts non-contiguous backward gradients.
-
-    The upstream high-level wrapper launches the backward kernel with
-    ``grad_output`` as-is. DSV4 consumes HC combinations through transposed
-    matmul sites, so autograd can provide a transposed gradient layout. The
-    low-level TileKernels backward kernel requires contiguous row-major inputs.
-    """
+    """TileKernels Sinkhorn wrapper that accepts non-contiguous backward gradients."""
 
     @staticmethod
     def forward(
@@ -218,8 +226,19 @@ class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
     ) -> tuple[torch.Tensor, None, None]:
         (flat_x,) = ctx.saved_tensors
         flat_grad_output = grad_output.contiguous().view_as(flat_x)
-        flat_grad_input = torch.empty_like(flat_x)
-        ctx.bwd_kernel(flat_grad_output, flat_x, flat_grad_input)
+        pad_tokens = (-flat_x.shape[0]) % 32
+        if pad_tokens:
+            flat_x_for_bwd = torch.cat([flat_x, flat_x.new_zeros((pad_tokens, *flat_x.shape[1:]))], dim=0)
+            grad_for_bwd = torch.cat(
+                [flat_grad_output, flat_grad_output.new_zeros((pad_tokens, *flat_grad_output.shape[1:]))],
+                dim=0,
+            )
+            grad_input_padded = torch.empty_like(flat_x_for_bwd)
+            ctx.bwd_kernel(grad_for_bwd, flat_x_for_bwd, grad_input_padded)
+            flat_grad_input = grad_input_padded[: flat_x.shape[0]]
+        else:
+            flat_grad_input = torch.empty_like(flat_x)
+            ctx.bwd_kernel(flat_grad_output, flat_x, flat_grad_input)
         return flat_grad_input.view(ctx.input_shape), None, None
 
 
@@ -247,62 +266,69 @@ def dsv4_sinkhorn_normalize(
     return sinkhorn_normalize_torch(x, repeat=repeat, eps=eps)
 
 
-def _seq_positions_from_ids(seq_ids: torch.Tensor) -> torch.Tensor:
-    """Return each valid token's slot offset inside its packed sample."""
-    seq_ids = seq_ids.to(dtype=torch.int64)
-    valid = seq_ids >= 0
-    if seq_ids.shape[1] == 0:
-        return torch.empty_like(seq_ids, dtype=torch.int64)
+def query_seq_positions_from_ids(query_seq_ids: torch.Tensor) -> torch.Tensor:
+    """Return each query token's ordinal inside its packed sample."""
+    query_seq_ids = query_seq_ids.to(dtype=torch.int64)
+    valid = query_seq_ids >= 0
+    if query_seq_ids.shape[1] == 0:
+        return torch.empty_like(query_seq_ids, dtype=torch.int64)
 
-    absolute = torch.arange(seq_ids.shape[1], device=seq_ids.device, dtype=torch.int64).view(1, -1)
-    absolute = absolute.expand_as(seq_ids)
-    valid_indices = torch.where(valid, absolute, torch.full_like(absolute, -1))
-    prev_valid_indices = torch.cat(
-        [seq_ids.new_full((seq_ids.shape[0], 1), -1), valid_indices[:, :-1]],
+    prev = torch.cat(
+        [query_seq_ids.new_full((query_seq_ids.shape[0], 1), -1), query_seq_ids[:, :-1]],
         dim=1,
-    ).cummax(dim=1).values
-    prev_valid_ids = torch.gather(seq_ids, dim=1, index=prev_valid_indices.clamp(min=0))
-    prev_valid_ids = torch.where(prev_valid_indices >= 0, prev_valid_ids, torch.full_like(prev_valid_ids, -1))
-    starts = valid & (seq_ids != prev_valid_ids)
-    start_positions = torch.where(starts, absolute, torch.zeros_like(seq_ids))
+    )
+    starts = valid & (query_seq_ids != prev)
+    absolute = torch.arange(query_seq_ids.shape[1], device=query_seq_ids.device, dtype=torch.int64).view(1, -1)
+    start_positions = torch.where(starts, absolute.expand_as(query_seq_ids), torch.zeros_like(query_seq_ids))
     start_offsets = start_positions.cummax(dim=1).values
-    positions = absolute - start_offsets
+    positions = absolute.expand_as(query_seq_ids) - start_offsets
     return torch.where(valid, positions, torch.full_like(positions, -1))
 
 
-def query_seq_positions_from_ids(query_seq_ids: torch.Tensor) -> torch.Tensor:
-    """Return each query token's slot offset inside its packed sample."""
-    return _seq_positions_from_ids(query_seq_ids)
-
-
-def packed_query_positions(
+def _query_local_positions(
     query_seq_ids: torch.Tensor,
-    query_positions: torch.Tensor | None = None,
+    query_positions: torch.Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
 ) -> torch.Tensor:
-    """Return sample-local query positions for packed compressed-KV causality.
-
-    Under CP a shard may start in the middle of a packed sample, so deriving
-    positions from shard-local ``seq_ids`` would incorrectly restart at 0.
-    Prefer model ``position_ids`` when available.
-    """
-    query_seq_ids = query_seq_ids.to(dtype=torch.int64)
     if query_positions is None:
         return query_seq_positions_from_ids(query_seq_ids)
-
-    query_positions = query_positions.to(device=query_seq_ids.device, dtype=torch.int64)
-    if query_positions.dim() == 1:
-        if query_positions.numel() != query_seq_ids.shape[1]:
+    query_positions = query_positions.to(device=device, dtype=torch.int64)
+    if query_positions.ndim == 1:
+        if query_positions.numel() != seq_len:
             raise ValueError(
-                "query_positions length must match packed query length "
-                f"(got {query_positions.numel()} vs {query_seq_ids.shape[1]})"
+                f"query_positions length must match seq_len (got {query_positions.numel()} vs {seq_len})"
             )
-        query_positions = query_positions.view(1, -1).expand_as(query_seq_ids)
-    elif query_positions.shape != query_seq_ids.shape:
+        return query_positions.unsqueeze(0).expand(batch_size, -1)
+    if query_positions.shape != (batch_size, seq_len):
+        raise ValueError(f"query_positions must have shape {(batch_size, seq_len)}, got {tuple(query_positions.shape)}")
+    return query_positions
+
+
+def _pooled_local_positions(
+    pooled_seq_ids: torch.Tensor,
+    pooled_positions: torch.Tensor | None,
+    *,
+    batch_size: int,
+    pooled_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if pooled_positions is None:
+        return pooled_seq_positions_from_ids(pooled_seq_ids)
+    pooled_positions = pooled_positions.to(device=device, dtype=torch.int64)
+    if pooled_positions.ndim == 1:
+        if pooled_positions.numel() != pooled_len:
+            raise ValueError(
+                f"pooled_positions length must match pooled_len (got {pooled_positions.numel()} vs {pooled_len})"
+            )
+        return pooled_positions.unsqueeze(0).expand(batch_size, -1)
+    if pooled_positions.shape != (batch_size, pooled_len):
         raise ValueError(
-            f"query_positions must have shape {tuple(query_seq_ids.shape)} or rank-1 query length, "
-            f"got {tuple(query_positions.shape)}"
+            f"pooled_positions must have shape {(batch_size, pooled_len)}, got {tuple(pooled_positions.shape)}"
         )
-    return torch.where(query_seq_ids >= 0, query_positions, torch.full_like(query_positions, -1))
+    return pooled_positions
 
 
 def build_dsv4_sparse_topk_indices(
@@ -320,16 +346,17 @@ def build_dsv4_sparse_topk_indices(
     query_global_start: int | None = None,
     query_positions: torch.Tensor | None = None,
     query_key_positions: torch.Tensor | None = None,
+    query_local_positions: torch.Tensor | None = None,
+    pooled_local_positions: torch.Tensor | None = None,
     raw_key_len: int | None = None,
     query_seq_ids: torch.Tensor | None = None,
     raw_key_seq_ids: torch.Tensor | None = None,
-    raw_key_sample_positions: torch.Tensor | None = None,
     pooled_seq_ids: torch.Tensor | None = None,
-    pooled_seq_positions: torch.Tensor | None = None,
-    query_sample_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build Miles-style top-k key indices for DSV4 local-window + compressed KV attention."""
     raw_key_len = key_len - n_pooled if raw_key_len is None else raw_key_len
+    if n_pooled > 0 and compress_ratio <= 0:
+        raise ValueError("compress_ratio must be positive when compressed KV entries are requested")
     query_global_start = query_start if query_global_start is None else query_global_start
     window = min(raw_key_len, window_size)
     if query_positions is None:
@@ -346,13 +373,10 @@ def build_dsv4_sparse_topk_indices(
             if query_key_positions is not None
             else q_global_pos
         )
-
-    if (
-        query_seq_ids is not None
-        and raw_key_seq_ids is not None
-        and query_sample_positions is not None
-        and raw_key_sample_positions is not None
-    ):
+    k_pos = (q_pos.unsqueeze(1) - window_size + 1).clamp(min=0) + torch.arange(window, device=device)
+    valid_window_2d = (k_pos <= q_pos.unsqueeze(1)) & (k_pos < raw_key_len)
+    window_topk_2d = torch.where(valid_window_2d, k_pos, torch.full_like(k_pos, -1)).to(torch.int32)
+    if query_seq_ids is not None and raw_key_seq_ids is not None:
         query_seq_ids = query_seq_ids.to(device=device, dtype=torch.int64)
         raw_key_seq_ids = raw_key_seq_ids.to(device=device, dtype=torch.int64)
         if query_seq_ids.shape != (batch_size, seq_len):
@@ -361,96 +385,22 @@ def build_dsv4_sparse_topk_indices(
             raise ValueError(
                 f"raw_key_seq_ids must have shape {(batch_size, raw_key_len)}, got {tuple(raw_key_seq_ids.shape)}"
             )
-        raw_key_sample_positions = raw_key_sample_positions.to(device=device, dtype=torch.int64)
-        if raw_key_sample_positions.shape != (batch_size, raw_key_len):
-            raise ValueError(
-                f"raw_key_sample_positions must have shape {(batch_size, raw_key_len)}, "
-                f"got {tuple(raw_key_sample_positions.shape)}"
-            )
-
-        query_local_positions = packed_query_positions(query_seq_ids, query_sample_positions)
-        if query_key_positions is None:
-            query_raw_positions = torch.arange(seq_len, device=device, dtype=torch.int64).view(1, -1)
-            query_raw_positions = query_raw_positions.expand(batch_size, -1)
-        else:
-            query_raw_positions = query_key_positions.to(device=device, dtype=torch.int64)
-            if query_raw_positions.dim() == 1:
-                if query_raw_positions.numel() != seq_len:
-                    raise ValueError(
-                        "query_key_positions length must match seq_len "
-                        f"(got {query_raw_positions.numel()} vs {seq_len})"
-                    )
-                query_raw_positions = query_raw_positions.view(1, -1).expand(batch_size, -1)
-            elif query_raw_positions.shape != (batch_size, seq_len):
-                raise ValueError(
-                    f"query_key_positions must have shape {(batch_size, seq_len)} or rank-1 seq_len, "
-                    f"got {tuple(query_raw_positions.shape)}"
-                )
-
-        window_offsets = torch.arange(window, device=device, dtype=torch.int64).view(1, 1, -1)
-        candidate_sample_positions = query_local_positions.unsqueeze(-1) - window + 1 + window_offsets
-        candidate_raw_positions = (
-            query_raw_positions.unsqueeze(-1)
-            - query_local_positions.unsqueeze(-1)
-            + candidate_sample_positions
-        )
-        valid_window = (
-            (query_seq_ids.unsqueeze(-1) >= 0)
-            & (query_local_positions.unsqueeze(-1) >= 0)
-            & (candidate_sample_positions >= 0)
-            & (candidate_raw_positions >= 0)
-            & (candidate_raw_positions < raw_key_len)
-        )
-        safe_raw = candidate_raw_positions.clamp(min=0, max=max(raw_key_len - 1, 0)).long()
-        gathered_seq_ids = torch.gather(
-            raw_key_seq_ids.unsqueeze(1).expand(-1, seq_len, -1),
-            dim=-1,
-            index=safe_raw,
-        )
-        gathered_sample_positions = torch.gather(
-            raw_key_sample_positions.unsqueeze(1).expand(-1, seq_len, -1),
-            dim=-1,
-            index=safe_raw,
-        )
-        valid_window = (
-            valid_window
-            & (gathered_seq_ids == query_seq_ids.unsqueeze(-1))
-            & (gathered_sample_positions == candidate_sample_positions)
-        )
+        safe_raw = window_topk_2d.clamp(min=0, max=max(raw_key_len - 1, 0)).long()
+        gathered_seq_ids = raw_key_seq_ids[:, safe_raw]
+        same_seq = gathered_seq_ids == query_seq_ids.unsqueeze(-1)
+        valid_window = (window_topk_2d.unsqueeze(0) >= 0) & same_seq & (query_seq_ids.unsqueeze(-1) >= 0)
         topk = torch.where(
             valid_window,
-            candidate_raw_positions,
-            torch.full_like(candidate_raw_positions, -1),
-        ).to(torch.int32)
+            window_topk_2d.unsqueeze(0).expand(batch_size, -1, -1),
+            torch.full((batch_size, seq_len, window), -1, dtype=torch.int32, device=device),
+        )
     else:
-        k_pos = (q_pos.unsqueeze(1) - window_size + 1).clamp(min=0) + torch.arange(window, device=device)
-        window_topk_2d = torch.where(k_pos > q_pos.unsqueeze(1), torch.full_like(k_pos, -1), k_pos).to(torch.int32)
-        if query_seq_ids is not None and raw_key_seq_ids is not None:
-            query_seq_ids = query_seq_ids.to(device=device, dtype=torch.int64)
-            raw_key_seq_ids = raw_key_seq_ids.to(device=device, dtype=torch.int64)
-            if query_seq_ids.shape != (batch_size, seq_len):
-                raise ValueError(
-                    f"query_seq_ids must have shape {(batch_size, seq_len)}, got {tuple(query_seq_ids.shape)}"
-                )
-            if raw_key_seq_ids.shape != (batch_size, raw_key_len):
-                raise ValueError(
-                    f"raw_key_seq_ids must have shape {(batch_size, raw_key_len)}, got {tuple(raw_key_seq_ids.shape)}"
-                )
-            safe_raw = window_topk_2d.clamp(min=0, max=max(raw_key_len - 1, 0)).long()
-            gathered_seq_ids = raw_key_seq_ids[:, safe_raw]
-            same_seq = gathered_seq_ids == query_seq_ids.unsqueeze(-1)
-            valid_window = (window_topk_2d.unsqueeze(0) >= 0) & same_seq & (query_seq_ids.unsqueeze(-1) >= 0)
-            topk = torch.where(
-                valid_window,
-                window_topk_2d.unsqueeze(0).expand(batch_size, -1, -1),
-                torch.full((batch_size, seq_len, window), -1, dtype=torch.int32, device=device),
-            )
-        else:
-            topk = window_topk_2d.unsqueeze(0).expand(batch_size, -1, -1)
+        topk = window_topk_2d.unsqueeze(0).expand(batch_size, -1, -1)
 
     if n_pooled > 0:
         if compressed_topk is not None:
             compressed_topk = compressed_topk.to(device=device)
+            valid_pool_idx = (compressed_topk >= 0) & (compressed_topk < n_pooled)
             if query_seq_ids is not None and pooled_seq_ids is not None:
                 pooled_seq_ids = pooled_seq_ids.to(device=device, dtype=torch.int64)
                 if pooled_seq_ids.shape != (batch_size, n_pooled):
@@ -463,26 +413,37 @@ def build_dsv4_sparse_topk_indices(
                     dim=-1,
                     index=safe_pooled,
                 )
-                resolved_pooled_positions = resolve_pooled_seq_positions(pooled_seq_ids, pooled_seq_positions)
+                query_local_pos = _query_local_positions(
+                    query_seq_ids.to(device=device, dtype=torch.int64),
+                    query_local_positions,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=device,
+                )
+                pooled_local_pos = _pooled_local_positions(
+                    pooled_seq_ids,
+                    pooled_local_positions,
+                    batch_size=batch_size,
+                    pooled_len=n_pooled,
+                    device=device,
+                )
                 pooled_positions_for_query = torch.gather(
-                    resolved_pooled_positions.unsqueeze(1).expand(-1, seq_len, -1),
+                    pooled_local_pos.unsqueeze(1).expand(-1, seq_len, -1),
                     dim=-1,
                     index=safe_pooled,
                 )
-                query_local_positions = packed_query_positions(query_seq_ids, query_sample_positions)
-                threshold = ((query_local_positions + 1) // compress_ratio).unsqueeze(-1)
+                threshold = ((query_local_pos + 1) // compress_ratio).unsqueeze(-1)
                 valid_compressed = (
-                    (compressed_topk >= 0)
+                    valid_pool_idx
                     & (pooled_seq_for_query == query_seq_ids.to(device=device, dtype=torch.int64).unsqueeze(-1))
                     & (pooled_positions_for_query >= 0)
                     & (pooled_positions_for_query < threshold)
                     & (query_seq_ids.to(device=device, dtype=torch.int64).unsqueeze(-1) >= 0)
                 )
-                compressed_topk = torch.where(
-                    valid_compressed,
-                    compressed_topk,
-                    torch.full_like(compressed_topk, -1),
-                )
+                compressed_topk = torch.where(valid_pool_idx, compressed_topk, torch.full_like(compressed_topk, -1))
+                compressed_topk = torch.where(valid_compressed, compressed_topk, torch.full_like(compressed_topk, -1))
+            else:
+                compressed_topk = torch.where(valid_pool_idx, compressed_topk, torch.full_like(compressed_topk, -1))
             compressed = torch.where(
                 compressed_topk >= 0,
                 compressed_topk + raw_key_len,
@@ -497,12 +458,24 @@ def build_dsv4_sparse_topk_indices(
                     raise ValueError(
                         f"pooled_seq_ids must have shape {(batch_size, n_pooled)}, got {tuple(pooled_seq_ids.shape)}"
                     )
-                resolved_pooled_positions = resolve_pooled_seq_positions(pooled_seq_ids, pooled_seq_positions)
-                query_local_positions = packed_query_positions(query_seq_ids, query_sample_positions)
-                threshold = ((query_local_positions + 1) // compress_ratio).unsqueeze(-1)
+                pooled_seq_positions = _pooled_local_positions(
+                    pooled_seq_ids,
+                    pooled_local_positions,
+                    batch_size=batch_size,
+                    pooled_len=n_pooled,
+                    device=device,
+                )
+                query_local_pos = _query_local_positions(
+                    query_seq_ids,
+                    query_local_positions,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=device,
+                )
+                threshold = ((query_local_pos + 1) // compress_ratio).unsqueeze(-1)
                 allowed = (
-                    (resolved_pooled_positions.unsqueeze(1) >= 0)
-                    & (resolved_pooled_positions.unsqueeze(1) < threshold)
+                    (pooled_seq_positions.unsqueeze(1) >= 0)
+                    & (pooled_seq_positions.unsqueeze(1) < threshold)
                     & (pooled_seq_ids.unsqueeze(1) == query_seq_ids.unsqueeze(-1))
                     & (query_seq_ids.unsqueeze(-1) >= 0)
                 )
@@ -523,16 +496,15 @@ def build_dsv4_sparse_topk_indices(
                 compressed = compressed.expand(batch_size, -1, -1)
         topk = torch.cat([topk, compressed], dim=-1)
 
-    topk = torch.where((topk >= 0) & (topk < key_len), topk, torch.full_like(topk, -1))
-
     if attention_mask is not None:
         if attention_mask.dim() != 4:
             raise ValueError(f"Expected 4D additive attention mask, got rank {attention_mask.dim()}")
         safe_topk = topk.clamp(min=0, max=key_len - 1)
-        mask_values = torch.gather(attention_mask[:, 0, :, :key_len], dim=-1, index=safe_topk)
-        topk = torch.where((topk < 0) | (mask_values < 0), torch.full_like(topk, -1), topk)
+        mask_values = torch.gather(attention_mask[:, 0, :, :key_len], dim=-1, index=safe_topk.long())
+        topk = torch.where(mask_values < 0, torch.full_like(topk, -1), topk)
 
-    return topk
+    valid_range = (topk >= 0) & (topk < key_len)
+    return torch.where(valid_range, topk, torch.full_like(topk, -1))
 
 
 def sparse_attention_torch(
@@ -583,10 +555,9 @@ def dense_attention_topk_torch(
     topk_len = topk_idxs.shape[-1]
     attn_mask = torch.zeros(batch, seq_len, key_len, dtype=torch.bool, device=q.device)
     valid = (topk_idxs >= 0) & (topk_idxs < key_len)
-    safe_topk = topk_idxs.clamp(min=0, max=max(key_len - 1, 0))
     batch_idx = torch.arange(batch, device=q.device).view(batch, 1, 1).expand(batch, seq_len, topk_len)
     seq_idx = torch.arange(seq_len, device=q.device).view(1, seq_len, 1).expand(batch, seq_len, topk_len)
-    attn_mask[batch_idx[valid], seq_idx[valid], safe_topk[valid].long()] = True
+    attn_mask[batch_idx[valid], seq_idx[valid], topk_idxs[valid].long()] = True
 
     scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
     scores = scores.masked_fill(~attn_mask.unsqueeze(2), float("-inf"))
@@ -607,6 +578,8 @@ def dsv4_sparse_attention(
     backend: Dsv4SparseAttentionBackend,
 ) -> torch.Tensor:
     """Run DSV4 sparse attention through Miles TileLang kernels or torch fallback."""
+    valid_topk = (topk_idxs >= 0) & (topk_idxs < kv.shape[1])
+    topk_idxs = torch.where(valid_topk, topk_idxs, torch.full_like(topk_idxs, -1))
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -618,12 +591,6 @@ def dsv4_sparse_attention(
         kv = _pad_sparse_attn_kv_for_tilelang(kv.contiguous())
         sinks = sinks.float().contiguous()
         topk_idxs = topk_idxs.to(torch.int32).contiguous()
-        original_heads = q.shape[2]
-        if original_heads < 16:
-            q = q.contiguous()
-            head_pad = 16 - original_heads
-            q = torch.cat([q, q.new_zeros(*q.shape[:2], head_pad, q.shape[3])], dim=2).contiguous()
-            sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
 
         # Miles runs this kernel under tensor parallelism, so the kernel sees a
         # small local head count. AutoModel's DSV4 recipe currently uses TP=1,
@@ -636,13 +603,12 @@ def dsv4_sparse_attention(
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            # The chunked wrapper materializes only per-head chunks, avoiding a
-            # full [B, S, H, D] contiguous Q copy at 128K/CP.
-            output = _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
-        else:
-            q = q.contiguous()
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
-        return output[:, :, :original_heads, :]
+            # Do not materialize full transposed Q here. The chunked wrapper
+            # slices Q and makes each small tile contiguous before launching the
+            # TileLang kernel, saving a full [B, S, H, D] activation copy.
+            return _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+        q = q.contiguous()
+        return _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 
@@ -665,7 +631,12 @@ def _make_global_causal_cu_seqlens(
     device: torch.device,
     query_start: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build compressed-KV causal ranges for local CP query shards."""
+    """Build compressed-KV causal ranges for local CP query shards.
+
+    Miles' original helper assumes local query positions start at zero.  Under
+    context parallelism each rank scores a local query shard against global
+    pooled KV, so the end offset must be derived from global positions.
+    """
     positions = torch.arange(
         int(query_start),
         int(query_start) + int(seq_len_q),
@@ -678,29 +649,30 @@ def _make_global_causal_cu_seqlens(
 
 
 def pooled_seq_positions_from_ids(pooled_seq_ids: torch.Tensor) -> torch.Tensor:
-    """Best-effort pooled ordinal reconstruction from packed sample ids."""
-    return _seq_positions_from_ids(pooled_seq_ids)
+    """Return each pooled token's ordinal inside its packed sample.
 
-
-def resolve_pooled_seq_positions(
-    pooled_seq_ids: torch.Tensor,
-    pooled_seq_positions: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return pooled sample-local ordinals, preferring explicit position_ids-derived values."""
+    ``pooled_seq_ids`` uses ``-1`` for invalid/padding windows and otherwise
+    contains contiguous packed sample ids.  DeepSeek V4 causal compressed-KV
+    checks must compare query positions against this per-sample ordinal.  The
+    ordinal is based on the original pooled slot offset inside the sample, so
+    invalid overlap windows do not renumber later valid pooled slots.
+    """
     pooled_seq_ids = pooled_seq_ids.to(dtype=torch.int64)
-    if pooled_seq_positions is None:
-        return pooled_seq_positions_from_ids(pooled_seq_ids)
-    pooled_seq_positions = pooled_seq_positions.to(device=pooled_seq_ids.device, dtype=torch.int64)
-    if pooled_seq_positions.shape != pooled_seq_ids.shape:
-        raise ValueError(
-            f"pooled_seq_positions must have shape {tuple(pooled_seq_ids.shape)}, "
-            f"got {tuple(pooled_seq_positions.shape)}"
-        )
-    return torch.where(
-        pooled_seq_ids >= 0,
-        pooled_seq_positions,
-        torch.full_like(pooled_seq_positions, -1),
-    )
+    valid = pooled_seq_ids >= 0
+    if pooled_seq_ids.shape[1] == 0:
+        return torch.empty_like(pooled_seq_ids, dtype=torch.int64)
+
+    absolute = torch.arange(pooled_seq_ids.shape[1], device=pooled_seq_ids.device, dtype=torch.int64)
+    positions = torch.full_like(pooled_seq_ids, -1)
+    # Fallback path only; packed DSV4 mainline passes explicit pooled positions.
+    # Preserve invalid holes instead of renumbering later slots in the same sample.
+    for batch_idx in range(pooled_seq_ids.shape[0]):
+        row = pooled_seq_ids[batch_idx]
+        for seq_id in torch.unique(row[valid[batch_idx]]):
+            seq_mask = row == seq_id
+            first = absolute[seq_mask][0]
+            positions[batch_idx, seq_mask] = absolute[seq_mask] - first
+    return positions
 
 
 def _mask_indexer_scores_causal_(
@@ -709,10 +681,10 @@ def _mask_indexer_scores_causal_(
     compress_ratio: int,
     query_start: int = 0,
     query_positions: torch.Tensor | None = None,
+    query_local_positions: torch.Tensor | None = None,
     query_seq_ids: torch.Tensor | None = None,
     pooled_seq_ids: torch.Tensor | None = None,
-    pooled_seq_positions: torch.Tensor | None = None,
-    query_sample_positions: torch.Tensor | None = None,
+    pooled_local_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply the same compressed-KV causal rule to dense torch indexer scores."""
     seq_len_q = scores.shape[1]
@@ -739,9 +711,21 @@ def _mask_indexer_scores_causal_(
             raise ValueError(
                 f"pooled_seq_ids must have shape {(scores.shape[0], seq_len_kv)}, got {tuple(pooled_seq_ids.shape)}"
             )
-        query_local_positions = packed_query_positions(query_seq_ids, query_sample_positions)
-        threshold = ((query_local_positions + 1) // int(compress_ratio)).unsqueeze(-1)
-        pooled_positions = resolve_pooled_seq_positions(pooled_seq_ids, pooled_seq_positions).unsqueeze(1)
+        query_local_pos = _query_local_positions(
+            query_seq_ids,
+            query_local_positions,
+            batch_size=scores.shape[0],
+            seq_len=seq_len_q,
+            device=scores.device,
+        )
+        threshold = ((query_local_pos + 1) // int(compress_ratio)).unsqueeze(-1)
+        pooled_positions = _pooled_local_positions(
+            pooled_seq_ids,
+            pooled_local_positions,
+            batch_size=scores.shape[0],
+            pooled_len=seq_len_kv,
+            device=scores.device,
+        ).unsqueeze(1)
         scores = scores.masked_fill_(pooled_positions >= threshold, float("-inf"))
         same_seq = pooled_seq_ids.unsqueeze(1) == query_seq_ids.unsqueeze(-1)
         scores = scores.masked_fill(
@@ -768,9 +752,10 @@ def _query_positions_are_contiguous(query_positions: torch.Tensor | None, query_
 
 
 def extract_indexer_topk_scores_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
-    """Extract top-k score values, masking ``-1`` entries with ``-inf``."""
-    valid = (topk_indices >= 0) & (topk_indices < logits.shape[-1])
-    safe_indices = topk_indices.clamp(min=0, max=max(logits.shape[-1] - 1, 0)).to(torch.int64)
+    """Extract top-k score values, masking invalid entries with ``-inf``."""
+    key_len = logits.shape[-1]
+    valid = (topk_indices >= 0) & (topk_indices < key_len)
+    safe_indices = topk_indices.clamp(min=0, max=max(key_len - 1, 0)).to(torch.int64)
     scores = torch.gather(logits, dim=-1, index=safe_indices)
     return torch.where(valid, scores, torch.full((), float("-inf"), dtype=scores.dtype, device=scores.device))
 
@@ -785,10 +770,10 @@ def dsv4_indexer_scores(
     backend: Dsv4IndexerBackend,
     query_start: int = 0,
     query_positions: torch.Tensor | None = None,
+    query_local_positions: torch.Tensor | None = None,
     query_seq_ids: torch.Tensor | None = None,
     pooled_seq_ids: torch.Tensor | None = None,
-    pooled_seq_positions: torch.Tensor | None = None,
-    query_sample_positions: torch.Tensor | None = None,
+    pooled_local_positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run DSV4 C4 indexer scores through Miles TileLang kernels or torch fallback."""
     supports_tilelang_cu_seqlens = (
@@ -825,10 +810,10 @@ def dsv4_indexer_scores(
         compress_ratio=compress_ratio,
         query_start=query_start,
         query_positions=query_positions,
+        query_local_positions=query_local_positions,
         query_seq_ids=query_seq_ids,
         pooled_seq_ids=pooled_seq_ids,
-        pooled_seq_positions=pooled_seq_positions,
-        query_sample_positions=query_sample_positions,
+        pooled_local_positions=pooled_local_positions,
     )
 
 
@@ -842,14 +827,20 @@ def streaming_indexer_topk_indices_torch(
     softmax_scale: float,
     query_start: int = 0,
     query_positions: torch.Tensor | None = None,
+    query_local_positions: torch.Tensor | None = None,
     query_seq_ids: torch.Tensor | None = None,
     pooled_seq_ids: torch.Tensor | None = None,
-    pooled_seq_positions: torch.Tensor | None = None,
-    query_sample_positions: torch.Tensor | None = None,
+    pooled_local_positions: torch.Tensor | None = None,
     query_block_size: int = 256,
     key_block_size: int = 2048,
 ) -> torch.Tensor:
-    """Memory-bounded top-k for the DSV4 C4 indexer."""
+    """Memory-bounded top-k for the DSV4 C4 indexer.
+
+    Dense indexer logits have shape ``[B, S_query, S_pooled]`` and become the
+    first 128K blocker.  This helper streams over query and pooled-KV blocks,
+    keeping only the running top-k per query while preserving the same scoring
+    expression as :func:`indexer_scores_torch`.
+    """
     batch, seq_len, _, _ = q.shape
     pooled_len = pooled_kv.shape[1]
     topk = min(int(topk), pooled_len)
@@ -869,29 +860,47 @@ def streaming_indexer_topk_indices_torch(
         query_seq_ids = query_seq_ids.to(device=q.device, dtype=torch.int64)
         if query_seq_ids.shape != (batch, seq_len):
             raise ValueError(f"query_seq_ids must have shape {(batch, seq_len)}, got {tuple(query_seq_ids.shape)}")
+    if query_local_positions is not None and query_seq_ids is not None:
+        query_local_positions = _query_local_positions(
+            query_seq_ids,
+            query_local_positions,
+            batch_size=batch,
+            seq_len=seq_len,
+            device=q.device,
+        )
     if pooled_seq_ids is not None:
         pooled_seq_ids = pooled_seq_ids.to(device=q.device, dtype=torch.int64)
         if pooled_seq_ids.shape != (batch, pooled_len):
             raise ValueError(f"pooled_seq_ids must have shape {(batch, pooled_len)}, got {tuple(pooled_seq_ids.shape)}")
-        pooled_seq_positions = resolve_pooled_seq_positions(pooled_seq_ids, pooled_seq_positions)
+        pooled_seq_positions = _pooled_local_positions(
+            pooled_seq_ids,
+            pooled_local_positions,
+            batch_size=batch,
+            pooled_len=pooled_len,
+            device=q.device,
+        )
     else:
         pooled_seq_positions = None
-    query_sample_positions_all = None
-    if query_seq_ids is not None and pooled_seq_ids is not None:
-        query_sample_positions_all = packed_query_positions(query_seq_ids, query_sample_positions)
 
     for query_begin in range(0, seq_len, query_block_size):
         query_end = min(query_begin + query_block_size, seq_len)
         q_chunk = q[:, query_begin:query_end]
         weights_chunk = weights[:, query_begin:query_end].float()
         query_positions_chunk = (
-            torch.arange(query_start + query_begin, query_start + query_end, device=q.device)
+            torch.arange(
+                query_start + query_begin,
+                query_start + query_end,
+                device=q.device,
+            )
             if query_positions is None
             else query_positions[query_begin:query_end]
         )
         query_seq_ids_chunk = None if query_seq_ids is None else query_seq_ids[:, query_begin:query_end]
         if query_seq_ids_chunk is not None and pooled_seq_ids is not None:
-            query_local_positions_chunk = query_sample_positions_all[:, query_begin:query_end]
+            if query_local_positions is None:
+                query_local_positions_chunk = query_seq_positions_from_ids(query_seq_ids)[:, query_begin:query_end]
+            else:
+                query_local_positions_chunk = query_local_positions[:, query_begin:query_end]
             threshold = ((query_local_positions_chunk + 1) // compress_ratio).unsqueeze(-1)
         else:
             threshold = ((query_positions_chunk + 1) // compress_ratio).view(1, -1, 1)
@@ -962,6 +971,9 @@ def dsv4_indexer_topk_scores(
     backend: Dsv4IndexerBackend,
 ) -> torch.Tensor:
     """Run DSV4 C4 top-k indexer scores through Miles autograd kernels or torch fallback."""
+    pooled_len = pooled_kv.shape[1]
+    valid_topk = (topk_indices >= 0) & (topk_indices < pooled_len)
+    safe_topk_indices = torch.where(valid_topk, topk_indices, torch.full_like(topk_indices, -1))
     if _should_use_tilelang(
         backend,
         available=_HAS_MILES_INDEXER_AUTOGRAD,
@@ -974,9 +986,9 @@ def dsv4_indexer_topk_scores(
             pooled_kv.transpose(0, 1).contiguous(),
             (weights * softmax_scale).transpose(0, 1).contiguous(),
             compress_ratio,
-            topk_indices.shape[-1],
-            topk_indices.to(torch.int32).contiguous(),
+            safe_topk_indices.shape[-1],
+            safe_topk_indices.to(torch.int32).contiguous(),
         )
         return scores
     logits = indexer_scores_torch(q, pooled_kv, weights, softmax_scale)
-    return extract_indexer_topk_scores_torch(logits, topk_indices.long())
+    return extract_indexer_topk_scores_torch(logits, safe_topk_indices.long())

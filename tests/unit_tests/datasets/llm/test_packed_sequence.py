@@ -371,6 +371,53 @@ def test_cp_aware_packing_basic():
     assert sum(seq_lens_padded) == 16
 
 
+def test_packing_extra_sequence_padding_multiple():
+    """DSV4 compressed KV requires packed sample boundaries to align to ratio."""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5]],
+            "labels": [[1, 2, 3], [4, 5]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=32,
+        max_packs=None,
+        cp_size=2,
+        seq_padding_multiple=16,
+    )
+
+    assert packed_ds[0]["seq_lens"] == [3, 2]
+    assert packed_ds[0]["seq_lens_padded"] == [16, 16]
+    assert packed_ds[0]["input_ids"][:3] == [1, 2, 3]
+    assert packed_ds[0]["input_ids"][16:18] == [4, 5]
+
+
+def test_packing_trims_existing_attention_mask_padding():
+    """Pre-padded samples should not contribute padding tokens as real pack content."""
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 0, 0], [3, 4]],
+            "labels": [[1, 2, -100, -100], [3, 4]],
+            "attention_mask": [[1, 1, 0, 0], [1, 1]],
+        }
+    )
+
+    packed_ds = pack_dataset(
+        ds,
+        split="train",
+        packed_sequence_size=8,
+        max_packs=None,
+        cp_size=1,
+    )
+
+    assert packed_ds[0]["seq_lens"] == [2, 2]
+    assert packed_ds[0]["input_ids"][:4] == [1, 2, 3, 4]
+    assert packed_ds[0]["attention_mask"][:4] == [1, 1, 1, 1]
+
+
 def test_cp_aware_packing_different_cp_sizes():
     """Test CP-aware packing with different cp_size values"""
     ds = Dataset.from_dict(
@@ -384,7 +431,7 @@ def test_cp_aware_packing_different_cp_sizes():
     packed_ds = pack_dataset(
         ds,
         split="train",
-        packed_sequence_size=10,
+        packed_sequence_size=12,
         cp_size=2,
     )
 
@@ -398,7 +445,7 @@ def test_cp_aware_packing_different_cp_sizes():
     seq_lens_padded = packed_ds[0]["seq_lens_padded"]
     if isinstance(seq_lens_padded, torch.Tensor):
         seq_lens_padded = seq_lens_padded.tolist()
-    assert seq_lens_padded == [10]  # 5 -> 8 (CP-padded) + 2 (pack padding) = 10
+    assert seq_lens_padded == [12]  # 5 -> 8 (CP-padded) + 4 (pack padding) = 12
 
     # Test with cp_size=4 (divisibility factor = 8)
     packed_ds = pack_dataset(
@@ -456,7 +503,7 @@ def test_cp_aware_packing_multiple_packs():
     packed_ds = pack_dataset(
         ds,
         split="train",
-        packed_sequence_size=10,
+        packed_sequence_size=12,
         cp_size=2,
     )
 

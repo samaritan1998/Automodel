@@ -177,15 +177,30 @@ def _create_fsdp2_device_mesh(
         "since DDP usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
-    non_pp_size = dp_size * cp_size * tp_size
-    assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
-    if ep_size < non_pp_size:
-        ep_shard_size = non_pp_size // ep_size
-    else:
-        ep_shard_size = 1
-
     dp_shard_size = dp_size // dp_replicate_size
+
+    # With PP, different DP replicas can advance through the 1F1B pipeline at
+    # different speeds. If EP spans DP, ranks in one EP group can enter MoE
+    # collectives for different microbatches/layers. Prefer CP/TP as the EP
+    # domain when CP is active; CP ranks are synchronized by attention
+    # collectives at the same PP+DP coordinate.
+    ep_domain_dim_names = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.TP)
+    ep_domain_size = dp_size * tp_size
+    if pp_size > 1 and cp_size > 1:
+        ep_domain_dim_names = (MeshAxisName.CP, MeshAxisName.TP)
+        ep_domain_size = cp_size * tp_size
+    if ep_size > ep_domain_size:
+        raise ValueError(
+            f"ep_size={ep_size} exceeds the FSDP2 EP domain "
+            f"{tuple(str(n) for n in ep_domain_dim_names)} with size {ep_domain_size} "
+            f"(dp_size={dp_size}, cp_size={cp_size}, tp_size={tp_size}, pp_size={pp_size})"
+        )
+    if ep_domain_size % ep_size != 0:
+        raise ValueError(
+            f"FSDP2 EP domain {tuple(str(n) for n in ep_domain_dim_names)} "
+            f"with size {ep_domain_size} must be a multiple of ep_size ({ep_size})"
+        )
+    ep_shard_size = ep_domain_size // ep_size
 
     # Build main device mesh
     mesh_shape = (pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size)
@@ -236,14 +251,14 @@ def _create_fsdp2_device_mesh(
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
-    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
-    # EP spans dp, cp, and tp — the full non-pp rank space.
+    # Derive EP mesh by flattening the chosen per-PP domain and unflattening
+    # into (ep_shard, ep). For PP+CP this intentionally uses CP/TP, not DP/TP,
+    # to keep pipeline-skewed DP replicas out of the same EP collective group.
     moe_mesh = None
     if ep_size > 1:
-        non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
-        non_pp_mesh = device_mesh[non_pp_dims]._flatten()
+        ep_domain_mesh = device_mesh[ep_domain_dim_names]._flatten()
         moe_mesh = _unflatten_compat(
-            non_pp_mesh,
+            ep_domain_mesh,
             0,
             (ep_shard_size, ep_size),
             (MeshAxisName.EP_SHARD, MeshAxisName.EP),

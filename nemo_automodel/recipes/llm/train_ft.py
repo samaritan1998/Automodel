@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import importlib
 import warnings
 
 # Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
@@ -27,6 +26,7 @@ except ImportError:
     pass
 
 import inspect
+import importlib
 import logging
 import pathlib
 import time
@@ -152,16 +152,14 @@ def _uses_te_dot_product_attention(model_or_cfg):
     )
 
 
-def _get_attr_or_item(obj, key, default=None):
+def _get_attr_or_item(obj, name, default=None):
     if obj is None:
         return default
-    if hasattr(obj, key):
-        return getattr(obj, key)
-    if isinstance(obj, dict):
-        return obj.get(key, default)
+    if hasattr(obj, name):
+        return getattr(obj, name)
     get = getattr(obj, "get", None)
     if callable(get):
-        return get(key, default)
+        return get(name, default)
     return default
 
 
@@ -195,18 +193,49 @@ def _resolve_collate_fn(collate_fn):
     return collate_fn
 
 
-def _is_dsv4_tilelang_module(module: torch.nn.Module) -> bool:
-    return type(module).__name__ == "DeepseekV4Attention" and getattr(getattr(module, "backend", None), "attn", None) == "tilelang"
+def _is_dsv4_tilelang_module(module) -> bool:
+    backend = _get_attr_or_item(module, "backend")
+    if _get_attr_or_item(backend, "attn") != "tilelang":
+        return False
+    if type(module).__name__ in {"DeepseekV4ForCausalLM", "DeepseekV4Model"}:
+        return True
+    config = _get_attr_or_item(module, "config")
+    if _get_attr_or_item(config, "model_type", _get_attr_or_item(module, "model_type")) == "deepseek_v4":
+        return True
+    inner = getattr(module, "model", None)
+    return inner is not None and type(inner).__name__ == "DeepseekV4Model"
 
 
 def _uses_dsv4_manual_cp(model_or_cfg):
-    if isinstance(model_or_cfg, torch.nn.Module):
-        return any(_is_dsv4_tilelang_module(module) for module in model_or_cfg.modules())
-    backend = _get_attr_or_item(model_or_cfg, "backend", None)
-    attn_backend = _get_attr_or_item(backend, "attn", None)
-    cfg = _get_attr_or_item(model_or_cfg, "config", model_or_cfg)
-    model_type = _get_attr_or_item(cfg, "model_type", None)
-    return attn_backend == "tilelang" and model_type == "deepseek_v4"
+    cached = getattr(model_or_cfg, "_uses_dsv4_manual_cp_cache", None)
+    if cached is not None:
+        return cached
+
+    modules = (
+        list(getattr(model_or_cfg, "parts", [model_or_cfg]))
+        if isinstance(model_or_cfg, torch.nn.Module)
+        else [model_or_cfg]
+    )
+    for module in modules:
+        if _is_dsv4_tilelang_module(module):
+            result = True
+            break
+        if isinstance(module, torch.nn.Module):
+            result = any(
+                type(submodule).__name__ == "DeepseekV4Attention"
+                and _get_attr_or_item(_get_attr_or_item(submodule, "backend"), "attn") == "tilelang"
+                for submodule in module.modules()
+            )
+            if result:
+                break
+    else:
+        result = False
+
+    try:
+        setattr(model_or_cfg, "_uses_dsv4_manual_cp_cache", result)
+    except Exception:
+        pass
+    return result
 
 
 def _uses_thd_collater(cfg_dataloader):
@@ -586,12 +615,19 @@ def build_dataloader(
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
+        uses_dsv4_manual_cp = _uses_dsv4_manual_cp(model if model is not None else cfg_model)
 
         # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
         if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
+        if packed_sequence_size > 0 and packing_strategy == "thd" and uses_dsv4_manual_cp and not _uses_thd_collater(cfg_dl):
+            raise ValueError(
+                "DeepSeek V4 manual CP with THD packing requires "
+                "dataloader.collate_fn=nemo_automodel.components.datasets.utils.packed_sequence_thd_collater "
+                "so seq_ids/qkv_format metadata is available."
+            )
 
         # Apply packing if configured
         if packed_sequence_size > 0:
@@ -600,6 +636,11 @@ def build_dataloader(
                 ds = ds.shuffle(seed)
 
             if packing_strategy == "neat":
+                if uses_dsv4_manual_cp:
+                    raise ValueError(
+                        "DeepSeek V4 manual CP requires THD packing because the attention/compressor "
+                        "path consumes seq_ids. Use packed_sequence.packing_strategy='thd'."
+                    )
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
                 from nemo_automodel.components.datasets.utils import neat_packed_collater
                 from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
@@ -609,7 +650,7 @@ def build_dataloader(
                     split=cfg_ds.split,
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    padding_idx=getattr(tokenizer, "pad_token_id", None) or 0,
                     drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
                 _attn_impl = get_attn_implementation(cfg_model)
@@ -624,9 +665,12 @@ def build_dataloader(
                     split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    padding_idx=getattr(tokenizer, "pad_token_id", None) or 0,
                     cp_size=cp_size,
-                    seq_pad_multiple=getattr(cfg_ps, "seq_pad_multiple", 1),
+                    seq_padding_multiple=128
+                    if uses_dsv4_manual_cp
+                    else getattr(cfg_ps, "seq_padding_multiple", getattr(cfg_ps, "seq_pad_multiple", None)),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
 
         if isinstance(ds, MegatronPretraining):
@@ -898,8 +942,8 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             cfg.model,
             cfg_ps=cfg.get("packed_sequence", None)
             if (
-                (_uses_te_dot_product_attention(cfg.model) or _uses_dsv4_manual_cp(model or cfg.model))
-                and _uses_thd_collater(cfg.dataloader)
+                (_uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader))
+                or _uses_dsv4_manual_cp(model if model is not None else cfg.model)
             )
             else None,
             seed=cfg.get("seed", 42),
@@ -998,10 +1042,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # THD override logic
             if (
                 self.dist_setup.cp_size > 1
-                and (
-                    _uses_te_dot_product_attention(self.cfg.model)
-                    or _uses_dsv4_manual_cp(self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model)
-                )
+                and _uses_te_dot_product_attention(self.cfg.model)
                 and _uses_thd_collater(self.cfg.dataloader)
             ):
                 pp_microbatch_size = 1
@@ -1080,6 +1121,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
+        if _uses_dsv4_manual_cp(model) and (
+            self.dist_setup.cp_size > 1 or self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+        ):
+            for part in getattr(model, "parts", [model]):
+                config = getattr(part, "config", getattr(getattr(part, "model", None), "config", None))
+                if int(getattr(config, "num_nextn_predict_layers", 0) or 0) > 0:
+                    raise ValueError(
+                        "DeepSeek V4 CP/packing training requires num_nextn_predict_layers=0. "
+                        "MTP next-token roll is not seq_id/CP-boundary aware yet."
+                    )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
@@ -1113,11 +1164,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
-            if (
-                hasattr(_m, "supports")
-                and not _m.supports_cp_with_sequence_packing
-                and not _uses_dsv4_manual_cp(_m)
-            ):
+            if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing and not _uses_dsv4_manual_cp(_m):
                 raise ValueError(
                     f"Context parallelism (cp_size={self.dist_setup.cp_size}) with packed sequences "
                     f"is not supported for {type(_m).__name__}.\n"
@@ -1409,7 +1456,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             use_dsv4_cp=_uses_dsv4_manual_cp(
                 self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
             ),
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            padding_token_id=(
+                self.tokenizer.pad_token_id
+                if self.tokenizer is not None and self.tokenizer.pad_token_id is not None
+                else 0
+            ),
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")
