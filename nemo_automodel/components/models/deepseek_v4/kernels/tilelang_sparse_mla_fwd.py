@@ -101,7 +101,7 @@ def sparse_mqa_fwd(
             KV_shared = T.alloc_shared([BI, D], dtype)
             O_shared = T.alloc_shared([H_per_block, D], dtype)
             Lse_shared = T.alloc_shared([H_per_block], accum_dtype)
-            mask = T.alloc_fragment([BI], "bool")
+            mask = T.alloc_fragment([BI], T.int32)
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
@@ -126,7 +126,7 @@ def sparse_mqa_fwd(
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
-                    mask[bi_i] = ValidMask[b_i, s_i, i_i * BI + bi_i] != 0
+                    mask[bi_i] = ValidMask[b_i, s_i, i_i * BI + bi_i]
 
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, i_i * BI + bi_i], d_i]
@@ -140,7 +140,11 @@ def sparse_mqa_fwd(
                     policy=T.GemmWarpPolicy.FullRow,
                 )
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], acc_s[h_i, bi_i], -T.infinity(acc_s.dtype))
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i] != 0,
+                        acc_s[h_i, bi_i],
+                        -T.infinity(acc_s.dtype),
+                    )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):

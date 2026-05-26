@@ -102,6 +102,19 @@ def _env_positive_int(name: str, default: int) -> int:
     return parsed
 
 
+def _env_optional_positive_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {parsed}")
+    return parsed
+
+
 def _normalize_sparse_attn_head_chunk(total_heads: int, requested_heads: int) -> int:
     """Pick a TileLang sparse-attention head chunk that does not create ragged tiles.
 
@@ -568,6 +581,28 @@ def dense_attention_topk_torch(
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
 
 
+def _dsv4_sparse_attention_tilelang(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float,
+    max_heads_per_kernel: int,
+) -> torch.Tensor:
+    """Run one TileLang sparse-attention query chunk."""
+    if topk_idxs.numel() == 0 or not bool((topk_idxs >= 0).any().item()):
+        # Sink-only rows have zero numerator. Keep a zero-gradient dependency on
+        # q so autograd sees the expected slice shape in chunked execution.
+        return q * 0
+    if q.shape[2] > max_heads_per_kernel:
+        if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
+            raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
+        # Do not materialize full transposed Q here. The chunked wrapper slices Q
+        # and makes each small head tile contiguous before launching TileLang.
+        return _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
+    return _miles_sparse_attn_tilelang(q.contiguous(), kv, sinks, topk_idxs, sm_scale)
+
+
 def dsv4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -600,15 +635,23 @@ def dsv4_sparse_attention(
         default_max_heads = 16 if q.shape[-1] >= 256 else 64
         requested_max_heads = _env_positive_int("DSV4_SPARSE_ATTN_MAX_HEADS_PER_KERNEL", default_max_heads)
         max_heads_per_kernel = _normalize_sparse_attn_head_chunk(q.shape[2], requested_max_heads)
-        if q.shape[2] > max_heads_per_kernel:
-            if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
-                raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            # Do not materialize full transposed Q here. The chunked wrapper
-            # slices Q and makes each small tile contiguous before launching the
-            # TileLang kernel, saving a full [B, S, H, D] activation copy.
-            return _miles_sparse_attn_tilelang_head_chunked(q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale)
-        q = q.contiguous()
-        return _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale)
+        query_chunk_size = _env_optional_positive_int("DSV4_SPARSE_ATTN_QUERY_CHUNK")
+        if query_chunk_size is not None and q.shape[1] > query_chunk_size:
+            outputs = []
+            for start in range(0, q.shape[1], query_chunk_size):
+                end = min(start + query_chunk_size, q.shape[1])
+                outputs.append(
+                    _dsv4_sparse_attention_tilelang(
+                        q[:, start:end, :, :],
+                        kv,
+                        sinks,
+                        topk_idxs[:, start:end, :],
+                        sm_scale,
+                        max_heads_per_kernel,
+                    )
+                )
+            return torch.cat(outputs, dim=1)
+        return _dsv4_sparse_attention_tilelang(q, kv, sinks, topk_idxs, sm_scale, max_heads_per_kernel)
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 
