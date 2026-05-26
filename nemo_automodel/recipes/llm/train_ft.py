@@ -120,6 +120,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+PACKED_SEQUENCE_THD_COLLATER_TARGET = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+
 
 # ---------------------------
 #  Stateless helper functions
@@ -162,6 +164,13 @@ def _get_attr_or_item(obj, name, default=None):
     if callable(get):
         return get(name, default)
     return default
+
+
+def _set_attr_or_item(obj, name, value):
+    if isinstance(obj, dict):
+        obj[name] = value
+    else:
+        setattr(obj, name, value)
 
 
 def _import_object(path: str):
@@ -244,9 +253,7 @@ def _uses_thd_collater(cfg_dataloader):
 
     collate_fn = _get_attr_or_item(cfg_dataloader, "collate_fn", None)
     target = _collate_fn_target(collate_fn)
-    return collate_fn == packed_sequence_thd_collater or target == (
-        "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
-    )
+    return collate_fn == packed_sequence_thd_collater or target == PACKED_SEQUENCE_THD_COLLATER_TARGET
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -624,11 +631,12 @@ def build_dataloader(
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
         if packed_sequence_size > 0 and packing_strategy == "thd" and uses_dsv4_manual_cp and not _uses_thd_collater(cfg_dl):
-            raise ValueError(
-                "DeepSeek V4 manual CP with THD packing requires "
-                "dataloader.collate_fn=nemo_automodel.components.datasets.utils.packed_sequence_thd_collater "
-                "so seq_ids/qkv_format metadata is available."
+            logger.warning(
+                "DeepSeek V4 manual CP with THD packing requires dataloader.collate_fn=%s "
+                "so seq_ids/qkv_format metadata is available; configuring it automatically.",
+                PACKED_SEQUENCE_THD_COLLATER_TARGET,
             )
+            _set_attr_or_item(cfg_dl, "collate_fn", PACKED_SEQUENCE_THD_COLLATER_TARGET)
 
         # Apply packing if configured
         if packed_sequence_size > 0:
