@@ -395,6 +395,7 @@ def _validate_dsv4_packed_metadata(
     seq_ids: torch.Tensor,
     labels: torch.Tensor,
     position_ids: torch.Tensor,
+    token_positions: torch.Tensor | None,
     padding_mask: torch.Tensor | None,
 ) -> None:
     padding_from_seq_ids = seq_ids < 0
@@ -402,6 +403,13 @@ def _validate_dsv4_packed_metadata(
         raise ValueError("DeepSeek V4 packed manual CP requires padding_mask to equal (seq_ids < 0)")
     if padding_from_seq_ids.any() and not torch.all(labels[padding_from_seq_ids] == -100):
         raise ValueError("DeepSeek V4 packed manual CP requires labels to be -100 where seq_ids < 0")
+    if token_positions is None:
+        raise ValueError("DeepSeek V4 packed manual CP requires dsv4_token_positions")
+    if not isinstance(token_positions, torch.Tensor) or token_positions.shape != seq_ids.shape:
+        raise ValueError("DeepSeek V4 packed manual CP requires dsv4_token_positions to match seq_ids shape")
+    expected_token_positions = torch.arange(seq_ids.shape[1], device=seq_ids.device).unsqueeze(0).expand_as(seq_ids)
+    if not torch.equal(token_positions.to(device=seq_ids.device, dtype=torch.int64), expected_token_positions):
+        raise ValueError("DeepSeek V4 packed manual CP requires dsv4_token_positions to be contiguous global positions")
 
     alignment = _dsv4_packed_alignment()
     absolute = torch.arange(seq_ids.shape[1], device=seq_ids.device, dtype=torch.int64)
@@ -477,6 +485,7 @@ def _validate_dsv4_manual_cp_batch(batch, seq_len: int, *, packed_thd: bool = Fa
             seq_ids=seq_ids,
             labels=labels,
             position_ids=position_ids,
+            token_positions=batch.get("dsv4_token_positions"),
             padding_mask=padding_mask,
         )
         return

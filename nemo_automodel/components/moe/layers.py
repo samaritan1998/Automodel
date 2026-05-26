@@ -289,6 +289,21 @@ class Gate(nn.Module):
         self._last_expert_load: Optional[torch.Tensor] = None
         self._last_aux_loss: Optional[torch.Tensor] = None
 
+    def _aggregate_expert_load_over_cp(
+        self,
+        expert_load: torch.Tensor,
+        cp_mesh: Optional[DeviceMesh],
+    ) -> tuple[torch.Tensor, bool]:
+        if cp_mesh is None or cp_mesh.size() <= 1:
+            return expert_load, False
+        expert_load = expert_load.float()
+        torch.distributed.all_reduce(
+            expert_load,
+            op=torch.distributed.ReduceOp.SUM,
+            group=cp_mesh.get_group(),
+        )
+        return expert_load, True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -420,8 +435,10 @@ class Gate(nn.Module):
             weights = weights.to(dtype=original_dtype)
             original_scores = original_scores.to(dtype=original_dtype)
 
+        expert_load_is_cp_global = False
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
+            expert_load, expert_load_is_cp_global = self._aggregate_expert_load_over_cp(expert_load, cp_mesh)
 
         if self._track_load_balance:
             self._last_expert_load = expert_load.detach()
@@ -434,7 +451,13 @@ class Gate(nn.Module):
 
         aux_loss = None
         if self.aux_loss_coeff > 0 and self.training:
-            aux_loss = self._compute_aux_loss(original_scores, expert_load, token_mask, cp_mesh)
+            aux_loss = self._compute_aux_loss(
+                original_scores,
+                expert_load,
+                token_mask,
+                cp_mesh,
+                expert_load_is_cp_global=expert_load_is_cp_global,
+            )
             # Scale the aux_loss by the number of tokens.
             # Training scales all gradients by 1/(number of tokens).
             # To correct this scaling, we need to scale the aux_loss by number of tokens here.
@@ -536,6 +559,8 @@ class Gate(nn.Module):
         expert_load: torch.Tensor,
         token_mask: torch.Tensor,
         cp_mesh: Optional[DeviceMesh],
+        *,
+        expert_load_is_cp_global: bool = False,
     ) -> torch.Tensor:
         """
         Computes the auxiliary loss for load balancing.
@@ -551,6 +576,8 @@ class Gate(nn.Module):
             token_mask (torch.Tensor): Boolean mask indicating valid tokens.
                 Shape is [num_tokens].
             cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
+            expert_load_is_cp_global (bool): Whether expert_load has already
+                been summed across the CP mesh by the no-aux correction-bias path.
 
         Returns:
             torch.Tensor: Auxiliary loss for load balancing.
@@ -573,7 +600,12 @@ class Gate(nn.Module):
             context_length = DTensor.from_local(
                 context_length, device_mesh=cp_mesh, placements=[Partial()]
             ).full_tensor()
-            expert_load = DTensor.from_local(expert_load, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
+            if not expert_load_is_cp_global:
+                expert_load = DTensor.from_local(
+                    expert_load,
+                    device_mesh=cp_mesh,
+                    placements=[Partial()],
+                ).full_tensor()
             expert_scores = DTensor.from_local(expert_scores, device_mesh=cp_mesh, placements=[Partial()]).full_tensor()
 
         # Compute f_i (fraction of tokens dispatched to each expert).

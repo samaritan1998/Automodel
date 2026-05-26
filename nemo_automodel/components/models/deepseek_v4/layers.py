@@ -2101,6 +2101,14 @@ class DeepseekV4Attention(nn.Module):
         packed_sequence = isinstance(packed_seq_ids, torch.Tensor)
         if token_positions is not None and not isinstance(token_positions, torch.Tensor):
             token_positions = None
+        if cp_enabled and packed_sequence:
+            if token_positions is None:
+                raise ValueError("DeepSeek V4 packed manual CP requires dsv4_token_positions")
+            if token_positions.shape != packed_seq_ids.shape:
+                raise ValueError(
+                    "DeepSeek V4 packed manual CP requires dsv4_token_positions to match packed seq_ids shape "
+                    f"({tuple(token_positions.shape)} vs {tuple(packed_seq_ids.shape)})"
+                )
         _dsv4_debug(
             "attn.forward.begin",
             self.layer_idx,
