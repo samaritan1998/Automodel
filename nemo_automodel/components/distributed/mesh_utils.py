@@ -31,6 +31,7 @@ Usage:
     )
 """
 
+import datetime
 from typing import Optional, Tuple, Union
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -53,6 +54,7 @@ def create_device_mesh(
     cp_size: int = 1,
     ep_size: int = 1,
     world_size: int,
+    timeout_minutes: Optional[int] = None,
 ) -> Tuple[Optional[DeviceMesh], Optional[DeviceMesh]]:
     """Create device mesh based on distributed config type.
 
@@ -71,6 +73,7 @@ def create_device_mesh(
         cp_size: Context parallel size.
         ep_size: Expert parallel size (for MoE models).
         world_size: Total number of processes.
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         tuple: (device_mesh, moe_mesh)
@@ -97,6 +100,7 @@ def create_device_mesh(
             ep_size=ep_size,
             world_size=world_size,
             backend=distributed_config.backend,
+            timeout_minutes=timeout_minutes,
         )
     elif isinstance(distributed_config, MegatronFSDPConfig):
         mesh = _create_megatron_fsdp_device_mesh(
@@ -105,12 +109,28 @@ def create_device_mesh(
             cp_size=cp_size,
             world_size=world_size,
             backend=distributed_config.backend,
+            timeout_minutes=timeout_minutes,
         )
         return mesh, None
     elif isinstance(distributed_config, DDPConfig):
         return None, None  # DDP doesn't use device mesh
     else:
         raise ValueError(f"Unknown distributed config type: {type(distributed_config)}")
+
+
+def _set_default_pg_timeout(backend: str, timeout_minutes: Optional[int]) -> None:
+    if timeout_minutes is None or int(timeout_minutes) <= 0:
+        return
+
+    # DeviceMesh creates process groups internally. Updating c10d defaults lets
+    # those groups inherit the requested watchdog timeout without relying on
+    # backend-specific Options objects.
+    timeout = datetime.timedelta(minutes=int(timeout_minutes))
+    import torch.distributed.distributed_c10d as dist_c10d
+
+    dist_c10d.default_pg_timeout = timeout
+    if backend == "nccl" and getattr(dist_c10d, "default_pg_nccl_timeout", None) is not None:
+        dist_c10d.default_pg_nccl_timeout = timeout
 
 
 def _create_fsdp2_device_mesh(
@@ -122,6 +142,7 @@ def _create_fsdp2_device_mesh(
     ep_size: int,
     world_size: int,
     backend: str,
+    timeout_minutes: Optional[int],
 ) -> Tuple[DeviceMesh, Optional[DeviceMesh]]:
     """
     Create device mesh for FSDP2.
@@ -143,6 +164,7 @@ def _create_fsdp2_device_mesh(
         ep_size: Expert parallel size (for MoE models).
         world_size: Total number of processes.
         backend: Distributed backend ('nccl' or 'gloo').
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         tuple: (device_mesh, moe_mesh)
@@ -215,6 +237,7 @@ def _create_fsdp2_device_mesh(
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
 
+    _set_default_pg_timeout(backend, timeout_minutes)
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
         mesh_shape=mesh_shape,
@@ -273,6 +296,7 @@ def _create_megatron_fsdp_device_mesh(
     cp_size: int,
     world_size: int,
     backend: str,
+    timeout_minutes: Optional[int],
 ) -> DeviceMesh:
     """
     Create device mesh for MegatronFSDP.
@@ -288,6 +312,7 @@ def _create_megatron_fsdp_device_mesh(
         cp_size: Context parallel size.
         world_size: Total number of processes.
         backend: Distributed backend ('nccl' or 'gloo').
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         DeviceMesh: The device mesh for MegatronFSDP.
@@ -313,6 +338,7 @@ def _create_megatron_fsdp_device_mesh(
         assert shape > 0, f"Expected {name} > 0, got {shape}"
 
     # Build mesh [dp, cp, tp]
+    _set_default_pg_timeout(backend, timeout_minutes)
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
         mesh_shape=mesh_shape,

@@ -52,6 +52,23 @@ def _validate_strategy_kwargs(
         raise ValueError(f"Unknown options for strategy '{strategy_name}': {sorted(unknown)}")
 
 
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    if hasattr(cfg, "get"):
+        try:
+            return cfg.get(key, default)
+        except TypeError:
+            pass
+    return getattr(cfg, key, default)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def parse_distributed_section(cfg_dict: dict) -> dict:
     """Parse a flat distributed config dict into components for mesh creation.
 
@@ -90,6 +107,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
     activation_checkpointing: bool = cfg.pop("activation_checkpointing", False)
+    mesh_timeout_minutes: Optional[int] = _optional_int(cfg.pop("mesh_timeout_minutes", None))
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
     # ``_convert_``) that may leak from YAML configs.  They have no meaning
@@ -191,6 +209,7 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
         "pipeline_config": pipeline_config,
         "moe_config": moe_config,
         "activation_checkpointing": activation_checkpointing,
+        "mesh_timeout_minutes": mesh_timeout_minutes,
         "pp_enabled": parallelism["pp_size"] > 1,
         **parallelism,
     }
@@ -220,6 +239,10 @@ def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext
 
     cfg_dict = cfg.distributed.to_dict() if not isinstance(cfg, dict) else cfg
     parsed = parse_distributed_section(cfg_dict)
+    dist_env_cfg = _cfg_get(cfg, "dist_env", {})
+    mesh_timeout_minutes = parsed["mesh_timeout_minutes"] or _optional_int(
+        _cfg_get(dist_env_cfg, "timeout_minutes", None)
+    )
 
     device_mesh, moe_mesh = mesh_utils.create_device_mesh(
         parsed["strategy_config"],
@@ -230,6 +253,7 @@ def setup_distributed(cfg: Any, world_size: Optional[int] = None) -> MeshContext
         cp_size=parsed["cp_size"],
         ep_size=parsed["ep_size"],
         world_size=world_size,
+        timeout_minutes=mesh_timeout_minutes,
     )
 
     return MeshContext(
