@@ -91,6 +91,20 @@ def _uses_te_attention(model: "nn.Module") -> bool:
     return getattr(model, "_te_attention_injected", False)
 
 
+def _uses_dsv4_tilelang_manual_cp(model: "nn.Module") -> bool:
+    """True for the custom DeepSeek V4 TileLang path that implements CP internally."""
+    backend = getattr(model, "backend", None)
+    if getattr(backend, "attn", None) != "tilelang":
+        return False
+    if type(model).__name__ in {"DeepseekV4ForCausalLM", "DeepseekV4Model"}:
+        return True
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "deepseek_v4":
+        return True
+    inner = getattr(model, "model", None)
+    return inner is not None and type(inner).__name__ == "DeepseekV4Model"
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
@@ -200,6 +214,8 @@ class ModelSupports:
         | HF hybrid (Mamba)| any            | No      |
         +------------------+----------------+---------+
         """
+        if _uses_dsv4_tilelang_manual_cp(self._model):
+            return True
         if _has_backend(self._model):
             if _is_hybrid(self._model):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
@@ -219,7 +235,11 @@ class ModelSupports:
     @property
     def supports_sequence_packing(self) -> bool:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
-        sp_attn_backend = getattr(self._model, "_supports_sdpa", False) is True or _uses_te_attention(self._model)
+        sp_attn_backend = (
+            getattr(self._model, "_supports_sdpa", False) is True
+            or _uses_te_attention(self._model)
+            or _uses_dsv4_tilelang_manual_cp(self._model)
+        )
         return _supports_seq_lens(self._model) and sp_attn_backend
 
     @property
@@ -262,6 +282,8 @@ class ModelSupports:
     def supports_cp_with_sequence_packing(self) -> bool:
         """CP + packed sequences requires TE attention backend."""
         if self.cp_size <= 1:
+            return self.supports_sequence_packing
+        if _uses_dsv4_tilelang_manual_cp(self._model):
             return self.supports_sequence_packing
         return self.supports_sequence_packing and _uses_te_attention(self._model)
 
