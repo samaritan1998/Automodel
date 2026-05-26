@@ -190,9 +190,9 @@ def indexer_bwd_interface(
     grad_w = torch.empty_like(weights, dtype=torch.float32)
     grad_k = torch.zeros_like(index_k, dtype=torch.float32)
 
-    # Pad topk to block_I=32 boundary (kernel requires topk % block_I == 0 and topk >= 32)
+    # Pad topk to the kernel contract: power-of-two and block_I=32 aligned.
     padded_topk = max(k_top, 32)
-    padded_topk = ((padded_topk + 31) // 32) * 32
+    padded_topk = 1 << (padded_topk - 1).bit_length()
     if padded_topk != k_top:
         pad_size = padded_topk - k_top
         topk_indices = torch.cat(

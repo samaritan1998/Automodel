@@ -453,6 +453,13 @@ def parallelize_model(
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
+        if _is_deepseek_v4_model(model) and not ignore_router_for_ac:
+            raise ValueError(
+                "DeepSeek V4 activation checkpointing must set "
+                "distributed.moe.ignore_router_for_ac=true. Otherwise router side effects such as "
+                "expert-load accumulation and correction-bias updates can run again during checkpoint "
+                "recompute."
+            )
         apply_ac(model, ignore_router=ignore_router_for_ac)
 
     if ep_shard_axis_names is not None:

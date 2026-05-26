@@ -591,9 +591,9 @@ def _dsv4_sparse_attention_tilelang(
 ) -> torch.Tensor:
     """Run one TileLang sparse-attention query chunk."""
     if topk_idxs.numel() == 0 or not bool((topk_idxs >= 0).any().item()):
-        # Sink-only rows have zero numerator. Keep a zero-gradient dependency on
-        # q so autograd sees the expected slice shape in chunked execution.
-        return q * 0
+        # Sink-only rows have zero numerator. Keep zero-gradient dependencies on
+        # all kernel inputs so distributed wrappers do not treat them as unused.
+        return q * 0 + kv.sum().to(q.dtype) * 0 + sinks.sum().to(q.dtype) * 0
     if q.shape[2] > max_heads_per_kernel:
         if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
             raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
