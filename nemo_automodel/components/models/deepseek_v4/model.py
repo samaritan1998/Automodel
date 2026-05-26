@@ -584,6 +584,10 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    # DSV4 has a PP-aware forward that preserves the HC stream axis and handles
+    # compressed-KV metadata. Generic HF pipeline patching must not replace it.
+    _pp_keep_self_forward: bool = True
+
     # Keep HC mixers and the MoE gate's correction bias in fp32 regardless of
     # the outer cast policy.  Matches HF PR 45616's
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
@@ -706,6 +710,28 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         text_model = text_model or self.model
         stage_modules = [list(modules) for modules in module_names_per_stage]
+        first_stage_modules = set(stage_modules[0]) if stage_modules else set()
+        num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
+        missing_hash_layers = [
+            layer_idx
+            for layer_idx in range(num_hash_layers)
+            if f"{layers_prefix}layers.{layer_idx}" not in first_stage_modules
+        ]
+        if missing_hash_layers:
+            placements = {}
+            missing = set(missing_hash_layers)
+            for stage_idx, modules in enumerate(stage_modules):
+                module_set = set(modules)
+                for layer_idx in list(missing):
+                    if f"{layers_prefix}layers.{layer_idx}" in module_set:
+                        placements[layer_idx] = stage_idx
+                        missing.remove(layer_idx)
+            raise ValueError(
+                "DeepSeek V4 hash-routing layers must all live on the first PP stage because only that stage "
+                "receives raw input_ids. "
+                f"Missing from stage 0: {missing_hash_layers}; placements={placements}. "
+                "Increase distributed.pipeline.layers_per_stage or use the default stage split."
+            )
 
         def append_once(modules: list[str], fqn: str) -> None:
             if fqn not in modules:

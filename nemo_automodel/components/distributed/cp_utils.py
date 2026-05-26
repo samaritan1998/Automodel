@@ -379,6 +379,63 @@ def _pad_tensor_along_dim(tensor: torch.Tensor, pad_len: int, dim: int, value) -
     return torch.cat([tensor, pad], dim=dim)
 
 
+def _dsv4_packed_alignment() -> int:
+    value = os.environ.get("DSV4_PACKED_ALIGNMENT", "128")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"DSV4_PACKED_ALIGNMENT must be an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"DSV4_PACKED_ALIGNMENT must be >= 1, got {parsed}")
+    return parsed
+
+
+def _validate_dsv4_packed_metadata(
+    *,
+    seq_ids: torch.Tensor,
+    labels: torch.Tensor,
+    position_ids: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+) -> None:
+    padding_from_seq_ids = seq_ids < 0
+    if padding_mask is not None and not torch.equal(padding_mask.to(torch.bool), padding_from_seq_ids):
+        raise ValueError("DeepSeek V4 packed manual CP requires padding_mask to equal (seq_ids < 0)")
+    if padding_from_seq_ids.any() and not torch.all(labels[padding_from_seq_ids] == -100):
+        raise ValueError("DeepSeek V4 packed manual CP requires labels to be -100 where seq_ids < 0")
+
+    alignment = _dsv4_packed_alignment()
+    absolute = torch.arange(seq_ids.shape[1], device=seq_ids.device, dtype=torch.int64)
+    for batch_idx in range(seq_ids.shape[0]):
+        row = seq_ids[batch_idx].to(torch.int64)
+        valid = row >= 0
+        if not valid.any():
+            continue
+
+        prev = torch.cat([row.new_full((1,), -1), row[:-1]])
+        starts = valid & (row != prev)
+        start_positions = torch.nonzero(starts, as_tuple=False).flatten()
+        if alignment > 1 and start_positions.numel() and torch.any(start_positions % alignment != 0):
+            bad_start = int(start_positions[start_positions % alignment != 0][0].item())
+            raise ValueError(
+                "DeepSeek V4 packed manual CP requires each sample start to align to "
+                f"{alignment} tokens; first bad start={bad_start}. "
+                "Use THD packing with seq_pad_multiple >= 128."
+            )
+
+        start_ids = row[start_positions]
+        if torch.unique(start_ids).numel() != start_ids.numel():
+            raise ValueError("DeepSeek V4 packed manual CP requires each seq_id to form one contiguous block")
+
+        start_markers = torch.where(starts, absolute, torch.zeros_like(absolute))
+        start_offsets = torch.cummax(start_markers, dim=0).values
+        expected_positions = absolute - start_offsets
+        actual_positions = position_ids[batch_idx].to(torch.int64)
+        if not torch.equal(actual_positions[valid], expected_positions[valid]):
+            raise ValueError(
+                "DeepSeek V4 packed manual CP requires position_ids to start at 0 and increment within each seq_id"
+            )
+
+
 def _validate_dsv4_manual_cp_batch(batch, seq_len: int, *, packed_thd: bool = False) -> None:
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -397,6 +454,7 @@ def _validate_dsv4_manual_cp_batch(batch, seq_len: int, *, packed_thd: bool = Fa
             raise ValueError("DeepSeek V4 packed manual CP requires seq_ids to match input_ids shape")
 
     valid_mask = None
+    padding_mask = None
     if "attention_mask" in batch:
         attention_mask = batch["attention_mask"]
         if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
@@ -404,15 +462,23 @@ def _validate_dsv4_manual_cp_batch(batch, seq_len: int, *, packed_thd: bool = Fa
         if attention_mask.shape != input_ids.shape:
             raise ValueError("DeepSeek V4 manual CP requires attention_mask to match input_ids shape")
         valid_mask = attention_mask.to(torch.bool)
+        padding_mask = valid_mask.logical_not()
     elif "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
         if not isinstance(padding_mask, torch.Tensor) or padding_mask.ndim != 2:
             raise ValueError("DeepSeek V4 manual CP supports only 2D right-padded padding_mask")
         if padding_mask.shape != input_ids.shape:
             raise ValueError("DeepSeek V4 manual CP requires padding_mask to match input_ids shape")
+        padding_mask = padding_mask.to(torch.bool)
         valid_mask = padding_mask.logical_not()
 
     if packed_thd:
+        _validate_dsv4_packed_metadata(
+            seq_ids=seq_ids,
+            labels=labels,
+            position_ids=position_ids,
+            padding_mask=padding_mask,
+        )
         return
 
     expected = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
