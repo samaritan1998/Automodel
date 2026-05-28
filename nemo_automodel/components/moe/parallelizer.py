@@ -346,8 +346,6 @@ def apply_fsdp(
 def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p2p"):
     """Configure context parallelism for attention and MoE layers."""
 
-    from transformer_engine.pytorch.attention import DotProductAttention
-
     if hasattr(model, "model") and model.model is not None:
         _model = model.model
     else:
@@ -364,20 +362,31 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = block.self_attn.attn_module
-            if not isinstance(attn_module, DotProductAttention):
-                logger.warning(
-                    "Skipping CP setup for block with non-TE attention module: %s",
-                    type(attn_module).__name__,
+            self_attn = getattr(block, "self_attn", None)
+            if type(self_attn).__name__ == "DeepseekV4Attention":
+                # DeepSeek V4 implements manual CP inside its TileLang attention.
+                # It does not expose TE's DotProductAttention.attn_module hook.
+                self_attn._cp_mesh = cp_mesh
+            else:
+                attn_module = getattr(self_attn, "attn_module", None)
+                if attn_module is None:
+                    logger.warning("Skipping CP setup for block without an attention module.")
+                    continue
+                from transformer_engine.pytorch.attention import DotProductAttention
+
+                if not isinstance(attn_module, DotProductAttention):
+                    logger.warning(
+                        "Skipping CP setup for block with non-TE attention module: %s",
+                        type(attn_module).__name__,
+                    )
+                    continue
+                attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
+                attn_module.set_context_parallel_group(
+                    cp_mesh.get_group(),
+                    torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
+                    _get_cp_stream(),
+                    cp_comm_type=attn_cp_comm_type,
                 )
-                continue
-            attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
-            attn_module.set_context_parallel_group(
-                cp_mesh.get_group(),
-                torch.distributed.get_process_group_ranks(cp_mesh.get_group()),
-                _get_cp_stream(),
-                cp_comm_type=attn_cp_comm_type,
-            )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
 
@@ -444,6 +453,13 @@ def parallelize_model(
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
     if activation_checkpointing:
+        if _is_deepseek_v4_model(model) and not ignore_router_for_ac:
+            raise ValueError(
+                "DeepSeek V4 activation checkpointing must set "
+                "distributed.moe.ignore_router_for_ac=true. Otherwise router side effects such as "
+                "expert-load accumulation and correction-bias updates can run again during checkpoint "
+                "recompute."
+            )
         apply_ac(model, ignore_router=ignore_router_for_ac)
 
     if ep_shard_axis_names is not None:

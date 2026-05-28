@@ -94,6 +94,7 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 1024
+  seq_padding_multiple: 128
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

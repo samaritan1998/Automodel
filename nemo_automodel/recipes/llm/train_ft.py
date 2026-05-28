@@ -26,7 +26,9 @@ except ImportError:
     pass
 
 import inspect
+import importlib
 import logging
+import os
 import pathlib
 import time
 from contextlib import nullcontext
@@ -118,6 +120,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+PACKED_SEQUENCE_THD_COLLATER_TARGET = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+
 
 # ---------------------------
 #  Stateless helper functions
@@ -151,14 +155,105 @@ def _uses_te_dot_product_attention(model_or_cfg):
     )
 
 
+def _get_attr_or_item(obj, name, default=None):
+    if obj is None:
+        return default
+    if hasattr(obj, name):
+        return getattr(obj, name)
+    get = getattr(obj, "get", None)
+    if callable(get):
+        return get(name, default)
+    return default
+
+
+def _set_attr_or_item(obj, name, value):
+    if isinstance(obj, dict):
+        obj[name] = value
+    else:
+        setattr(obj, name, value)
+
+
+def _import_object(path: str):
+    module_name, _, attr = path.rpartition(".")
+    if not module_name or not attr:
+        raise ValueError(f"Invalid import path: {path!r}")
+    return getattr(importlib.import_module(module_name), attr)
+
+
+def _collate_fn_target(collate_fn):
+    if isinstance(collate_fn, str):
+        return collate_fn
+    return _get_attr_or_item(collate_fn, "_target_", None)
+
+
+def _resolve_collate_fn(collate_fn):
+    if collate_fn is None:
+        return None
+    if callable(collate_fn):
+        return collate_fn
+    target = _collate_fn_target(collate_fn)
+    if target is not None:
+        if hasattr(collate_fn, "instantiate"):
+            return lambda batch, collate_cfg=collate_fn: collate_cfg.instantiate(batch=batch)
+        imported = _import_object(target) if isinstance(target, str) else target
+        return lambda batch, fn=imported: fn(batch)
+    if isinstance(collate_fn, str):
+        imported = _import_object(collate_fn)
+        return lambda batch, fn=imported: fn(batch)
+    return collate_fn
+
+
+def _is_dsv4_tilelang_module(module) -> bool:
+    backend = _get_attr_or_item(module, "backend")
+    if _get_attr_or_item(backend, "attn") != "tilelang":
+        return False
+    if type(module).__name__ in {"DeepseekV4ForCausalLM", "DeepseekV4Model"}:
+        return True
+    config = _get_attr_or_item(module, "config")
+    if _get_attr_or_item(config, "model_type", _get_attr_or_item(module, "model_type")) == "deepseek_v4":
+        return True
+    inner = getattr(module, "model", None)
+    return inner is not None and type(inner).__name__ == "DeepseekV4Model"
+
+
+def _uses_dsv4_manual_cp(model_or_cfg):
+    cached = getattr(model_or_cfg, "_uses_dsv4_manual_cp_cache", None)
+    if cached is not None:
+        return cached
+
+    modules = (
+        list(getattr(model_or_cfg, "parts", [model_or_cfg]))
+        if isinstance(model_or_cfg, torch.nn.Module)
+        else [model_or_cfg]
+    )
+    for module in modules:
+        if _is_dsv4_tilelang_module(module):
+            result = True
+            break
+        if isinstance(module, torch.nn.Module):
+            result = any(
+                type(submodule).__name__ == "DeepseekV4Attention"
+                and _get_attr_or_item(_get_attr_or_item(submodule, "backend"), "attn") == "tilelang"
+                for submodule in module.modules()
+            )
+            if result:
+                break
+    else:
+        result = False
+
+    try:
+        setattr(model_or_cfg, "_uses_dsv4_manual_cp_cache", result)
+    except Exception:
+        pass
+    return result
+
+
 def _uses_thd_collater(cfg_dataloader):
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    return (
-        True
-        if hasattr(cfg_dataloader, "collate_fn") and cfg_dataloader.collate_fn == packed_sequence_thd_collater
-        else False
-    )
+    collate_fn = _get_attr_or_item(cfg_dataloader, "collate_fn", None)
+    target = _collate_fn_target(collate_fn)
+    return collate_fn == packed_sequence_thd_collater or target == PACKED_SEQUENCE_THD_COLLATER_TARGET
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -528,12 +623,20 @@ def build_dataloader(
 
         packed_sequence_size = getattr(cfg_ps, "packed_sequence_size", 0)
         packing_strategy = getattr(cfg_ps, "packing_strategy", "thd")
+        uses_dsv4_manual_cp = _uses_dsv4_manual_cp(model if model is not None else cfg_model)
 
         # check if packed sequence is supported (only for thd strategy)
         supports_seq_lens = _supports_seq_lens(model)
         if packed_sequence_size > 0 and packing_strategy == "thd" and not supports_seq_lens:
             logging.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
             packed_sequence_size = 0
+        if packed_sequence_size > 0 and packing_strategy == "thd" and uses_dsv4_manual_cp and not _uses_thd_collater(cfg_dl):
+            logger.warning(
+                "DeepSeek V4 manual CP with THD packing requires dataloader.collate_fn=%s "
+                "so seq_ids/qkv_format metadata is available; configuring it automatically.",
+                PACKED_SEQUENCE_THD_COLLATER_TARGET,
+            )
+            _set_attr_or_item(cfg_dl, "collate_fn", PACKED_SEQUENCE_THD_COLLATER_TARGET)
 
         # Apply packing if configured
         if packed_sequence_size > 0:
@@ -542,6 +645,11 @@ def build_dataloader(
                 ds = ds.shuffle(seed)
 
             if packing_strategy == "neat":
+                if uses_dsv4_manual_cp:
+                    raise ValueError(
+                        "DeepSeek V4 manual CP requires THD packing because the attention/compressor "
+                        "path consumes seq_ids. Use packed_sequence.packing_strategy='thd'."
+                    )
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
                 from nemo_automodel.components.datasets.utils import neat_packed_collater
                 from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
@@ -551,7 +659,7 @@ def build_dataloader(
                     split=cfg_ds.split,
                     pack_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    padding_idx=getattr(tokenizer, "pad_token_id", None) or 0,
                     drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
                 _attn_impl = get_attn_implementation(cfg_model)
@@ -566,8 +674,12 @@ def build_dataloader(
                     split=cfg_ds.split,
                     packed_sequence_size=packed_sequence_size,
                     max_packs=getattr(cfg_ps, "max_packs", None),
-                    padding_idx=getattr(tokenizer, "pad_token_id", 0),
+                    padding_idx=getattr(tokenizer, "pad_token_id", None) or 0,
                     cp_size=cp_size,
+                    seq_padding_multiple=128
+                    if uses_dsv4_manual_cp
+                    else getattr(cfg_ps, "seq_padding_multiple", getattr(cfg_ps, "seq_pad_multiple", None)),
+                    drop_long_samples=getattr(cfg_ps, "drop_long_samples", True),
                 )
 
         if isinstance(ds, MegatronPretraining):
@@ -643,13 +755,9 @@ def build_dataloader(
         # Handle collate_fn with optional mask precomputation for pipeline parallelism
         dl_kwargs = dl_kwargs | {"dataset": ds}
 
-        # Handle collate_fn instantiation if it's a ConfigNode
+        # Handle collate_fn as a callable, import path string, or ConfigNode.
         if hasattr(cfg_dl, "collate_fn"):
-            if hasattr(cfg_dl.collate_fn, "_target_"):
-                collate_cfg = cfg_dl.collate_fn
-                dl_kwargs["collate_fn"] = lambda batch: collate_cfg.instantiate(batch=batch)
-            else:
-                dl_kwargs["collate_fn"] = cfg_dl.collate_fn
+            dl_kwargs["collate_fn"] = _resolve_collate_fn(cfg_dl.collate_fn)
             assert callable(dl_kwargs["collate_fn"]), "collate_fn must be callable"
 
         # Chain with mask precomputation if PP is enabled
@@ -813,10 +921,22 @@ def build_wandb(cfg) -> wandb.Run:
     kwargs = cfg.wandb.to_dict()
     if kwargs.get("name", "") == "":
         kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
+    settings_kwargs = {"silent": True}
+    init_timeout = kwargs.pop("init_timeout", None)
+    if init_timeout not in (None, ""):
+        # Older wandb versions do not accept init_timeout as wandb.init().
+        # Prefer Settings when available, and also set the env fallback.
+        os.environ.setdefault("WANDB_INIT_TIMEOUT", str(init_timeout))
+        settings_kwargs["init_timeout"] = float(init_timeout)
+    try:
+        settings = Settings(**settings_kwargs)
+    except TypeError:
+        settings_kwargs.pop("init_timeout", None)
+        settings = Settings(**settings_kwargs)
     run = wandb.init(
         **kwargs,
         config=cfg.to_dict(),
-        settings=Settings(silent=True),
+        settings=settings,
     )
     return run
 
@@ -842,7 +962,10 @@ def build_validation_dataloader(cfg, dp_world_size, dp_rank, pp_enabled, model: 
             cfg.validation_dataloader,
             cfg.model,
             cfg_ps=cfg.get("packed_sequence", None)
-            if _uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader)
+            if (
+                (_uses_te_dot_product_attention(cfg.model) and _uses_thd_collater(cfg.dataloader))
+                or _uses_dsv4_manual_cp(model if model is not None else cfg.model)
+            )
             else None,
             seed=cfg.get("seed", 42),
             local_batch_size=cfg.get("step_scheduler.local_batch_size", 1),
@@ -1019,6 +1142,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing=self.dist_setup.activation_checkpointing,
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
+        if _uses_dsv4_manual_cp(model) and (
+            self.dist_setup.cp_size > 1 or self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+        ):
+            for part in getattr(model, "parts", [model]):
+                config = getattr(part, "config", getattr(getattr(part, "model", None), "config", None))
+                if int(getattr(config, "num_nextn_predict_layers", 0) or 0) > 0:
+                    raise ValueError(
+                        "DeepSeek V4 CP/packing training requires num_nextn_predict_layers=0. "
+                        "MTP next-token roll is not seq_id/CP-boundary aware yet."
+                    )
         self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
@@ -1052,7 +1185,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.dist_setup.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
-            if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
+            if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing and not _uses_dsv4_manual_cp(_m):
                 raise ValueError(
                     f"Context parallelism (cp_size={self.dist_setup.cp_size}) with packed sequences "
                     f"is not supported for {type(_m).__name__}.\n"
@@ -1341,7 +1474,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
             )
             and _uses_thd_collater(self.cfg.dataloader),
-            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            use_dsv4_cp=_uses_dsv4_manual_cp(
+                self.model_parts[0] if hasattr(self, "model_parts") else self.cfg.model
+            ),
+            padding_token_id=(
+                self.tokenizer.pad_token_id
+                if self.tokenizer is not None and self.tokenizer.pad_token_id is not None
+                else 0
+            ),
             num_chunks=_get_num_thd_chunks(self.pp_enabled, self.cfg),
         )
         labels = batch.pop("labels")

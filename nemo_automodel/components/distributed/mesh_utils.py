@@ -31,6 +31,7 @@ Usage:
     )
 """
 
+import datetime
 from typing import Optional, Tuple, Union
 
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -53,6 +54,7 @@ def create_device_mesh(
     cp_size: int = 1,
     ep_size: int = 1,
     world_size: int,
+    timeout_minutes: Optional[int] = None,
 ) -> Tuple[Optional[DeviceMesh], Optional[DeviceMesh]]:
     """Create device mesh based on distributed config type.
 
@@ -71,6 +73,7 @@ def create_device_mesh(
         cp_size: Context parallel size.
         ep_size: Expert parallel size (for MoE models).
         world_size: Total number of processes.
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         tuple: (device_mesh, moe_mesh)
@@ -97,6 +100,7 @@ def create_device_mesh(
             ep_size=ep_size,
             world_size=world_size,
             backend=distributed_config.backend,
+            timeout_minutes=timeout_minutes,
         )
     elif isinstance(distributed_config, MegatronFSDPConfig):
         mesh = _create_megatron_fsdp_device_mesh(
@@ -105,12 +109,28 @@ def create_device_mesh(
             cp_size=cp_size,
             world_size=world_size,
             backend=distributed_config.backend,
+            timeout_minutes=timeout_minutes,
         )
         return mesh, None
     elif isinstance(distributed_config, DDPConfig):
         return None, None  # DDP doesn't use device mesh
     else:
         raise ValueError(f"Unknown distributed config type: {type(distributed_config)}")
+
+
+def _set_default_pg_timeout(backend: str, timeout_minutes: Optional[int]) -> None:
+    if timeout_minutes is None or int(timeout_minutes) <= 0:
+        return
+
+    # DeviceMesh creates process groups internally. Updating c10d defaults lets
+    # those groups inherit the requested watchdog timeout without relying on
+    # backend-specific Options objects.
+    timeout = datetime.timedelta(minutes=int(timeout_minutes))
+    import torch.distributed.distributed_c10d as dist_c10d
+
+    dist_c10d.default_pg_timeout = timeout
+    if backend == "nccl" and getattr(dist_c10d, "default_pg_nccl_timeout", None) is not None:
+        dist_c10d.default_pg_nccl_timeout = timeout
 
 
 def _create_fsdp2_device_mesh(
@@ -122,6 +142,7 @@ def _create_fsdp2_device_mesh(
     ep_size: int,
     world_size: int,
     backend: str,
+    timeout_minutes: Optional[int],
 ) -> Tuple[DeviceMesh, Optional[DeviceMesh]]:
     """
     Create device mesh for FSDP2.
@@ -143,6 +164,7 @@ def _create_fsdp2_device_mesh(
         ep_size: Expert parallel size (for MoE models).
         world_size: Total number of processes.
         backend: Distributed backend ('nccl' or 'gloo').
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         tuple: (device_mesh, moe_mesh)
@@ -177,15 +199,30 @@ def _create_fsdp2_device_mesh(
         "since DDP usecase is not supported by FSDP2"
     )
 
-    # Expert parallelism: EP spans all non-pp dims (dp, cp, tp)
-    non_pp_size = dp_size * cp_size * tp_size
-    assert non_pp_size % ep_size == 0, f"{non_pp_size=} must be a multiple of {ep_size=}"
-    if ep_size < non_pp_size:
-        ep_shard_size = non_pp_size // ep_size
-    else:
-        ep_shard_size = 1
-
     dp_shard_size = dp_size // dp_replicate_size
+
+    # With PP, different DP replicas can advance through the 1F1B pipeline at
+    # different speeds. If EP spans DP, ranks in one EP group can enter MoE
+    # collectives for different microbatches/layers. Prefer CP/TP as the EP
+    # domain when CP is active; CP ranks are synchronized by attention
+    # collectives at the same PP+DP coordinate.
+    ep_domain_dim_names = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.TP)
+    ep_domain_size = dp_size * tp_size
+    if pp_size > 1 and cp_size > 1:
+        ep_domain_dim_names = (MeshAxisName.CP, MeshAxisName.TP)
+        ep_domain_size = cp_size * tp_size
+    if ep_size > ep_domain_size:
+        raise ValueError(
+            f"ep_size={ep_size} exceeds the FSDP2 EP domain "
+            f"{tuple(str(n) for n in ep_domain_dim_names)} with size {ep_domain_size} "
+            f"(dp_size={dp_size}, cp_size={cp_size}, tp_size={tp_size}, pp_size={pp_size})"
+        )
+    if ep_domain_size % ep_size != 0:
+        raise ValueError(
+            f"FSDP2 EP domain {tuple(str(n) for n in ep_domain_dim_names)} "
+            f"with size {ep_domain_size} must be a multiple of ep_size ({ep_size})"
+        )
+    ep_shard_size = ep_domain_size // ep_size
 
     # Build main device mesh
     mesh_shape = (pp_size, dp_replicate_size, dp_shard_size, cp_size, tp_size)
@@ -200,6 +237,7 @@ def _create_fsdp2_device_mesh(
         assert isinstance(shape, int), f"Expected {name} to be an int, but got {type(shape)}"
         assert shape > 0, f"Expected {name} > 0, got {shape}"
 
+    _set_default_pg_timeout(backend, timeout_minutes)
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
         mesh_shape=mesh_shape,
@@ -236,14 +274,14 @@ def _create_fsdp2_device_mesh(
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_SHARD_CP, _dp_shard_cp_flat)
     device_mesh._flatten_mapping.setdefault(MeshAxisName.DP_CP, _dp_cp_flat)
 
-    # Derive EP mesh by flattening all non-pp dims and unflattening into (ep_shard, ep).
-    # EP spans dp, cp, and tp — the full non-pp rank space.
+    # Derive EP mesh by flattening the chosen per-PP domain and unflattening
+    # into (ep_shard, ep). For PP+CP this intentionally uses CP/TP, not DP/TP,
+    # to keep pipeline-skewed DP replicas out of the same EP collective group.
     moe_mesh = None
     if ep_size > 1:
-        non_pp_dims = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
-        non_pp_mesh = device_mesh[non_pp_dims]._flatten()
+        ep_domain_mesh = device_mesh[ep_domain_dim_names]._flatten()
         moe_mesh = _unflatten_compat(
-            non_pp_mesh,
+            ep_domain_mesh,
             0,
             (ep_shard_size, ep_size),
             (MeshAxisName.EP_SHARD, MeshAxisName.EP),
@@ -258,6 +296,7 @@ def _create_megatron_fsdp_device_mesh(
     cp_size: int,
     world_size: int,
     backend: str,
+    timeout_minutes: Optional[int],
 ) -> DeviceMesh:
     """
     Create device mesh for MegatronFSDP.
@@ -273,6 +312,7 @@ def _create_megatron_fsdp_device_mesh(
         cp_size: Context parallel size.
         world_size: Total number of processes.
         backend: Distributed backend ('nccl' or 'gloo').
+        timeout_minutes: Timeout for DeviceMesh-created process groups.
 
     Returns:
         DeviceMesh: The device mesh for MegatronFSDP.
@@ -298,6 +338,7 @@ def _create_megatron_fsdp_device_mesh(
         assert shape > 0, f"Expected {name} > 0, got {shape}"
 
     # Build mesh [dp, cp, tp]
+    _set_default_pg_timeout(backend, timeout_minutes)
     device_mesh = init_device_mesh(
         device_type="cuda" if backend == "nccl" else "cpu",
         mesh_shape=mesh_shape,

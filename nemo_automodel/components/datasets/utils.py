@@ -336,6 +336,11 @@ def packed_sequence_thd_collater(batch):
     if len(batch) == 0:
         return {}
 
+    def _as_int_list(value):
+        if isinstance(value, torch.Tensor):
+            return [int(v) for v in value.reshape(-1).tolist()]
+        return [int(v) for v in value]
+
     # If batch items lack packed-sequence metadata (e.g. from ChatDataset),
     # synthesize seq_lens, seq_lens_padded, and position_ids so that each
     # sample is treated as a single-sequence "pack".
@@ -346,9 +351,10 @@ def packed_sequence_thd_collater(batch):
         for item in batch:
             cur_len = len(item["input_ids"])
             if "attention_mask" in item:
-                actual_len = sum(item["attention_mask"])
-                item.pop("attention_mask")
+                attention_mask = _as_int_list(item["attention_mask"])
+                actual_len = int(sum(attention_mask))
             else:
+                attention_mask = [1] * cur_len
                 actual_len = cur_len
 
             pad_amount = max_len - cur_len
@@ -357,14 +363,46 @@ def packed_sequence_thd_collater(batch):
             # cu_seqlens_padded[-1] == total_tokens in the downstream THD pipeline.
             item["seq_lens_padded"] = [max_len]
             item["position_ids"] = list(range(max_len))
+            item["attention_mask"] = attention_mask
 
             if pad_amount > 0:
                 item["input_ids"] = list(item["input_ids"]) + [input_ids_pad] * pad_amount
                 item["labels"] = list(item["labels"]) + [-100] * pad_amount
+                item["attention_mask"] = item["attention_mask"] + [0] * pad_amount
+
+    for item in batch:
+        if "attention_mask" not in item:
+            item["attention_mask"] = [1] * len(item["input_ids"])
+
+    seq_id_rows = []
+    for item in batch:
+        seq_len = len(item["input_ids"])
+        attention_mask = _as_int_list(item["attention_mask"])
+        if len(attention_mask) < seq_len:
+            attention_mask = attention_mask + [0] * (seq_len - len(attention_mask))
+        elif len(attention_mask) > seq_len:
+            attention_mask = attention_mask[:seq_len]
+
+        row = []
+        next_seq_id = 0
+        for padded_len in _as_int_list(item["seq_lens_padded"]):
+            if padded_len <= 0 or padded_len == -1000:
+                continue
+            row.extend([next_seq_id] * padded_len)
+            next_seq_id += 1
+        if len(row) < seq_len:
+            row.extend([-1] * (seq_len - len(row)))
+        elif len(row) > seq_len:
+            row = row[:seq_len]
+        row = [seq_id if mask else -1 for seq_id, mask in zip(row, attention_mask)]
+        item["attention_mask"] = attention_mask
+        seq_id_rows.append(row)
 
     tokens = batchify(torch.stack([torch.tensor(x["input_ids"]) for x in batch]))
     labels = batchify(torch.stack([torch.tensor(x["labels"]) for x in batch]))
     position_ids = batchify(torch.stack([torch.tensor(x["position_ids"]) for x in batch]))
+    attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"], dtype=torch.long) for x in batch]))
+    seq_ids = batchify(torch.stack([torch.as_tensor(x, dtype=torch.long) for x in seq_id_rows]))
 
     seq_lens = batchify(torch.LongTensor(pad_within_micro([x["seq_lens"] for x in batch], -1000)))
     seq_lens_padded = batchify(torch.LongTensor(pad_within_micro([x["seq_lens_padded"] for x in batch], -1000)))
@@ -373,6 +411,8 @@ def packed_sequence_thd_collater(batch):
         "input_ids": tokens,
         "labels": labels,
         "position_ids": position_ids,
+        "attention_mask": attention_mask,
+        "seq_ids": seq_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "qkv_format": "thd",
